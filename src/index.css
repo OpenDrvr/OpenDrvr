@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans:
+    "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+
+  --color-surface-950: #070b14;
+  --color-surface-900: #0b1220;
+  --color-surface-850: #0e1728;
+  --color-surface-800: #111b2e;
+  --color-accent-300: #93c5fd;
+  --color-accent-400: #60a5fa;
+  --color-accent-500: #3b82f6;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-surface-950);
+    color: var(--color-slate-200);
+    font-family: var(--font-sans);
+  }
+
+  ::selection {
+    background-color: color-mix(in srgb, var(--color-accent-500) 40%, transparent);
+    color: white;
+  }
+}
+
+/* Subtle Windows-utility backdrop: a faint grid and a single blue light source. */
+.app-backdrop {
+  background-image:
+    radial-gradient(ellipse 70% 55% at 50% -10%, rgb(37 99 235 / 0.16), transparent 70%),
+    linear-gradient(to right, rgb(148 163 184 / 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgb(148 163 184 / 0.035) 1px, transparent 1px);
+  background-size:
+    100% 100%,
+    44px 44px,
+    44px 44px;
+}
