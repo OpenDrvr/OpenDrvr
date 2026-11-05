@@ -23,6 +23,9 @@ pub enum AppError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    #[error("database error: {0}")]
+    Database(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -35,6 +38,7 @@ impl AppError {
             Self::Io(_) => "io",
             Self::Serialization(_) => "serialization",
             Self::Validation(_) => "validation",
+            Self::Database(_) => "database",
             Self::Internal(_) => "internal",
         }
     }
@@ -46,6 +50,7 @@ impl AppError {
             Self::Io(_) => "A file system operation failed.",
             Self::Serialization(_) => "A data serialization operation failed.",
             Self::Validation(_) => "The request contained invalid input.",
+            Self::Database(_) => "A database operation failed.",
             Self::Internal(_) => "An internal backend error occurred.",
         }
     }

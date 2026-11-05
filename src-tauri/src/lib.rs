@@ -35,7 +35,15 @@ pub fn run() {
                 "OpenDrvr backend starting"
             );
 
-            app.manage(state::AppState::new(config));
+            let data_dir = platform::data_dir(app.handle());
+            let catalog_path = platform::catalog_path(app.handle());
+            let database = tauri::async_runtime::block_on(database::Database::initialize(
+                &config.database,
+                data_dir.as_deref(),
+                catalog_path.as_deref(),
+            ));
+
+            app.manage(state::AppState::new(config, database));
             Ok(())
         })
         .invoke_handler(crate::generate_command_handlers!())

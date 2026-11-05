@@ -2,6 +2,7 @@ import {
   CircleAlert,
   CircleCheck,
   Cpu,
+  Database,
   Download,
   HardDrive,
   RefreshCw,
@@ -9,8 +10,15 @@ import {
   ShieldCheck,
   Terminal,
 } from "lucide-react";
-import { useEffect, useState } from "react";
-import { getAppInfo, type AppInfo } from "./lib/tauri";
+import { useEffect, useState, type ReactNode } from "react";
+import {
+  databaseTestQuery,
+  getAppInfo,
+  getDatabaseHealth,
+  type AppInfo,
+  type DatabaseHealth,
+  type DatabaseTestResult,
+} from "./lib/tauri";
 
 type BackendState =
   | { status: "checking" }
@@ -252,6 +260,263 @@ function BackendPanel() {
   );
 }
 
+type DatabaseViewState =
+  | { status: "loading" }
+  | { status: "ready"; health: DatabaseHealth }
+  | { status: "error"; message: string };
+
+type TestViewState =
+  | { status: "idle" }
+  | { status: "running" }
+  | { status: "done"; result: DatabaseTestResult }
+  | { status: "error"; message: string };
+
+function DatabaseStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-4 border-b border-white/[0.06] py-2 last:border-0">
+      <dt className="text-xs text-slate-500">{label}</dt>
+      <dd className="font-mono text-xs text-slate-200">{value}</dd>
+    </div>
+  );
+}
+
+function DatabaseCard({
+  title,
+  subtitle,
+  healthy,
+  children,
+}: {
+  title: string;
+  subtitle: string;
+  healthy: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className="rounded-xl border border-white/10 bg-surface-900/60 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-medium text-slate-100">{title}</h3>
+          <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p>
+        </div>
+        <span
+          className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[0.65rem] font-medium ${
+            healthy
+              ? "border-emerald-400/20 bg-emerald-400/[0.07] text-emerald-300"
+              : "border-amber-400/20 bg-amber-400/[0.07] text-amber-300"
+          }`}
+        >
+          <span
+            className={`size-1.5 rounded-full ${healthy ? "bg-emerald-400" : "bg-amber-400"}`}
+            aria-hidden="true"
+          />
+          {healthy ? "Ready" : "Unavailable"}
+        </span>
+      </div>
+      <dl className="mt-3">{children}</dl>
+    </div>
+  );
+}
+
+function DatabasePanel() {
+  const [view, setView] = useState<DatabaseViewState>({ status: "loading" });
+  const [test, setTest] = useState<TestViewState>({ status: "idle" });
+  const isLoading = view.status === "loading";
+
+  useEffect(() => {
+    let active = true;
+
+    getDatabaseHealth().then(
+      (health) => {
+        if (active) {
+          setView({ status: "ready", health });
+        }
+      },
+      (error: unknown) => {
+        if (active) {
+          setView({ status: "error", message: describeError(error) });
+        }
+      },
+    );
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const recheckDatabases = () => {
+    setView({ status: "loading" });
+    setTest({ status: "idle" });
+
+    getDatabaseHealth().then(
+      (health) => setView({ status: "ready", health }),
+      (error: unknown) => setView({ status: "error", message: describeError(error) }),
+    );
+  };
+
+  const runTestQuery = () => {
+    setTest({ status: "running" });
+
+    databaseTestQuery("opendrvr.ui.probe").then(
+      (result) => setTest({ status: "done", result }),
+      (error: unknown) => setTest({ status: "error", message: describeError(error) }),
+    );
+  };
+
+  return (
+    <section
+      className="mt-6 rounded-2xl border border-white/10 bg-surface-900/70 p-1 shadow-2xl shadow-black/30 backdrop-blur"
+      aria-labelledby="database-heading"
+    >
+      <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <Database className="size-4 text-accent-400" aria-hidden="true" />
+            <h2 id="database-heading" className="text-sm font-semibold text-white">
+              Embedded database
+            </h2>
+          </div>
+          <p className="mt-1.5 text-sm leading-6 text-slate-400">
+            SQLite runs inside the Rust backend. The bundled catalog is read-only; user data lives
+            in a separate writable database.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={runTestQuery}
+            disabled={test.status === "running" || isLoading}
+            className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:border-white/20 hover:bg-white/[0.07] hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-400 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Terminal className="size-3.5" aria-hidden="true" />
+            Test query
+          </button>
+          <button
+            type="button"
+            onClick={recheckDatabases}
+            disabled={isLoading}
+            className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:border-white/20 hover:bg-white/[0.07] hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-400 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <RefreshCw
+              className={`size-3.5 ${isLoading ? "animate-spin" : ""}`}
+              aria-hidden="true"
+            />
+            Recheck
+          </button>
+        </div>
+      </div>
+
+      <div className="px-5 pb-5">
+        {view.status === "loading" ? (
+          <div
+            className="grid animate-pulse gap-4 sm:grid-cols-2"
+            aria-label="Loading database health"
+          >
+            {Array.from({ length: 2 }, (_, index) => (
+              <div
+                key={index}
+                className="h-36 rounded-xl border border-white/10 bg-surface-900/60"
+              />
+            ))}
+          </div>
+        ) : view.status === "error" ? (
+          <div className="flex gap-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.05] p-4">
+            <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-400" aria-hidden="true" />
+            <div>
+              <p className="text-sm font-medium text-amber-200">Database status unavailable</p>
+              <p className="mt-1 text-sm leading-6 text-amber-100/70">{view.message}</p>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <DatabaseCard
+                title="User database"
+                subtitle="Writable · app data directory"
+                healthy={view.health.user.status === "ok"}
+              >
+                <DatabaseStat
+                  label="Schema"
+                  value={
+                    view.health.user.status === "ok" ? `v${view.health.user.schemaVersion}` : "—"
+                  }
+                />
+                <DatabaseStat
+                  label="Tables"
+                  value={view.health.user.status === "ok" ? String(view.health.user.tables) : "—"}
+                />
+                <DatabaseStat label="Writable" value={view.health.user.writable ? "yes" : "no"} />
+              </DatabaseCard>
+
+              <DatabaseCard
+                title="Bundled catalog"
+                subtitle="Read-only · shipped with the app"
+                healthy={view.health.catalog.status === "ok"}
+              >
+                <DatabaseStat
+                  label="Schema"
+                  value={
+                    view.health.catalog.schemaVersion === null
+                      ? "—"
+                      : `v${view.health.catalog.schemaVersion}`
+                  }
+                />
+                <DatabaseStat
+                  label="Tables"
+                  value={
+                    view.health.catalog.status === "ok" ? String(view.health.catalog.tables) : "—"
+                  }
+                />
+                <DatabaseStat
+                  label="Manufacturers"
+                  value={
+                    view.health.catalog.status === "ok"
+                      ? String(view.health.catalog.manufacturerCount)
+                      : "—"
+                  }
+                />
+              </DatabaseCard>
+            </div>
+
+            {(view.health.user.message || view.health.catalog.message) && (
+              <div className="flex gap-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.05] p-4">
+                <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-400" aria-hidden="true" />
+                <div className="space-y-1 text-sm leading-6 text-amber-100/70">
+                  {view.health.user.message && <p>{view.health.user.message}</p>}
+                  {view.health.catalog.message && <p>{view.health.catalog.message}</p>}
+                </div>
+              </div>
+            )}
+
+            {test.status === "done" && (
+              <div className="rounded-xl border border-white/10 bg-surface-950/40 px-4 py-3 font-mono text-xs text-slate-400">
+                <span className="text-slate-500">database_test_query → </span>
+                <span className="text-emerald-300">ok</span>
+                <span className="text-slate-500"> · user ready: </span>
+                <span className="text-slate-200">{String(test.result.userDatabaseReady)}</span>
+                <span className="text-slate-500"> · catalog ready: </span>
+                <span className="text-slate-200">{String(test.result.catalogDatabaseReady)}</span>
+                <span className="text-slate-500"> · catalog schema: </span>
+                <span className="text-slate-200">
+                  {test.result.catalogSchemaVersion === null
+                    ? "n/a"
+                    : `v${test.result.catalogSchemaVersion}`}
+                </span>
+              </div>
+            )}
+
+            {test.status === "error" && (
+              <div className="rounded-xl border border-amber-400/20 bg-amber-400/[0.05] px-4 py-3 text-xs text-amber-100/70">
+                Test query failed: {test.message}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function App() {
   return (
     <div className="app-backdrop flex min-h-screen flex-col">
@@ -271,7 +536,7 @@ function App() {
             </span>
             <span className="inline-flex items-center gap-1.5 rounded-full border border-accent-400/20 bg-accent-400/[0.07] px-2.5 py-1 text-[0.68rem] font-medium text-accent-300">
               <ShieldCheck className="size-3" aria-hidden="true" />
-              Phase 2
+              Phase 3
             </span>
           </div>
         </div>
@@ -300,6 +565,8 @@ function App() {
         </section>
 
         <BackendPanel />
+
+        <DatabasePanel />
 
         <section className="mt-10" aria-labelledby="roadmap-heading">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -336,10 +603,10 @@ function App() {
         <div className="mt-10 flex items-start gap-3 rounded-xl border border-white/10 bg-surface-900/40 p-4">
           <CircleCheck className="mt-0.5 size-4 shrink-0 text-emerald-400" aria-hidden="true" />
           <p className="text-sm leading-6 text-slate-400">
-            <span className="font-medium text-slate-200">Phase 2 complete:</span> modular Rust
-            backend with typed commands, validated configuration, structured logging and clear
-            domain boundaries. Hardware detection, driver lookup and downloads are planned for later
-            phases.
+            <span className="font-medium text-slate-200">Phase 3 complete:</span> embedded SQLite
+            with a read-only bundled catalog, a separate writable user database, versioned
+            migrations, integrity recovery, and health checks exposed through typed Rust commands.
+            Hardware detection, driver lookup and downloads are planned for later phases.
           </p>
         </div>
       </main>

@@ -13,6 +13,8 @@ pub enum ModuleState {
     Ready,
     /// The module boundary exists but its feature work is scheduled later.
     Planned,
+    /// The module exists but could not be initialized.
+    Unavailable,
 }
 
 /// Safe, serializable description of a backend domain.
@@ -50,11 +52,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: AppConfig) -> Self {
+    pub fn new(config: AppConfig, database: Database) -> Self {
         let hardware = HardwareService::new();
         let drivers = DriverService::new();
         let sources = SourceRegistry::new();
-        let database = Database::new(config.database.clone());
         let downloads = DownloadManager::new(config.downloads.clone());
 
         Self {
@@ -84,7 +85,8 @@ mod tests {
 
     #[test]
     fn exposes_all_domain_modules() {
-        let state = AppState::new(AppConfig::default());
+        let config = AppConfig::default();
+        let state = AppState::new(config.clone(), Database::test_fixture(config.database));
         let statuses = state.module_status();
         let names: Vec<_> = statuses.iter().map(|status| status.name).collect();
 
@@ -96,7 +98,8 @@ mod tests {
 
     #[test]
     fn planned_and_ready_modules_are_distinguished() {
-        let state = AppState::new(AppConfig::default());
+        let config = AppConfig::default();
+        let state = AppState::new(config.clone(), Database::test_fixture(config.database));
         let statuses = state.module_status();
 
         let planned = statuses
@@ -107,8 +110,13 @@ mod tests {
             .iter()
             .filter(|status| status.state == ModuleState::Ready)
             .count();
+        let unavailable = statuses
+            .iter()
+            .filter(|status| status.state == ModuleState::Unavailable)
+            .count();
 
         assert_eq!(planned, 3);
-        assert_eq!(ready, 2);
+        assert_eq!(ready, 1);
+        assert_eq!(unavailable, 1);
     }
 }

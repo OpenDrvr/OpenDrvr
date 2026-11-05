@@ -1,6 +1,6 @@
 # OpenDrvr backend architecture
 
-This document describes the Rust backend as of **Phase 2**. The structure is
+This document describes the Rust backend as of **Phase 3**. The structure is
 intentionally conservative: it reserves clear module boundaries without adding
 abstractions that the application does not need yet. Hardware scanning, driver
 discovery, manufacturer integrations, downloads, and installations are **not**
@@ -19,16 +19,33 @@ src-tauri/src/
 ├── commands/
 │   ├── mod.rs           Command exports and the single registration macro
 │   ├── app.rs           get_app_info
+│   ├── database.rs      get_database_health, database_test_query
 │   └── system.rs        get_backend_status, ping
 ├── hardware/mod.rs      Hardware identification boundary (planned)
 ├── drivers/mod.rs       Driver matching boundary (planned)
 ├── sources/mod.rs       Official manufacturer sources boundary (planned)
-├── database/mod.rs      Local persistence boundary (planned)
+├── database/
+│   ├── mod.rs           Database service, startup degradation, health, test query
+│   ├── user.rs          Writable user database, migrations, recovery
+│   ├── catalog.rs       Read-only bundled catalog
+│   ├── models.rs        IPC-facing health and test DTOs
+│   └── test_support.rs  Temporary directories for tests
 ├── downloads/mod.rs     Download orchestration boundary (planned)
 ├── platform/
 │   ├── mod.rs           Portable platform helpers and support check
 │   └── windows.rs       Windows-only integration surface (future Win32 calls)
 └── utils/mod.rs         Small shared helpers such as input validation
+```
+
+Adjacent to `src/`:
+
+```text
+src-tauri/
+├── migrations/0001_user_initial.sql       Versioned user-database schema
+├── migrations/0002_user_configuration.sql Structured configuration table
+├── resources/catalog/schema.sql           Catalog schema source
+├── resources/catalog/catalog.sqlite3      Generated read-only snapshot
+└── examples/build_catalog.rs              Catalog regeneration tool
 ```
 
 Each directory is a Rust module with its own `mod.rs`. Keeping a directory
@@ -107,6 +124,49 @@ Example:
 `RUST_LOG` overrides the configured log level, which is useful during
 development.
 
+### Embedded database split
+
+SQLite is embedded through SQLx 0.8 with the bundled SQLite build, so users
+never install or configure a database server. Two independent databases keep
+shipped data and user data from interfering:
+
+| Database | Location                                 | Mode            | Contents                                                                               |
+| -------- | ---------------------------------------- | --------------- | -------------------------------------------------------------------------------------- |
+| User     | `app_data_dir()/opendrvr.sqlite3`        | read/write, WAL | preferences, structured configuration, scan history, download history, cached metadata |
+| Catalog  | Tauri resource `catalog/catalog.sqlite3` | read-only       | hardware identifiers, manufacturers, driver metadata, official sources                 |
+
+The catalog is resolved through `platform::catalog_path`. Tauri's resource
+directory is checked first, with a `CARGO_MANIFEST_DIR` fallback in debug builds
+so `cargo run` works before resources are copied. The catalog pool sets
+`read_only(true)` and `create_if_missing(false)`; accidental writes fail at the
+SQLite layer. Future incremental catalog updates should ship a new immutable
+snapshot instead of mutating the installed file.
+
+The user database lives in Tauri's per-user `app_data_dir`, which is writable
+without administrator rights and survives upgrades. It never shares a file or
+transaction with the catalog, so catalog updates cannot overwrite user data.
+Schema changes are applied by SQLx migrations in `src-tauri/migrations/`; the
+applied version is read from `_sqlx_migrations`.
+
+### Database initialization and recovery
+
+`Database::initialize` runs during Tauri `setup` and is intentionally
+non-fatal. The user database creates its parent directory, opens a pool with WAL,
+foreign keys, a 5-second busy timeout and at most five connections, then runs
+migrations and `PRAGMA quick_check`. If any step fails, the file and its
+`-wal`/`-shm` sidecars are renamed with a `.corrupt-<unix>` suffix and a fresh
+database is created once. A second failure leaves the component unavailable
+rather than aborting startup.
+
+A missing or unreadable catalog is logged and reported as unavailable; the user
+database and the rest of the application continue to work. Health and test-query
+commands surface both states to the UI.
+
+Connections stay inside Rust. Commands expose only health summaries and narrow
+results; SQL text is never accepted from the frontend. Queries use bound
+parameters (`?1`, `?2`) rather than string interpolation, and indexes cover the
+lookup and ordering paths defined in the initial schemas.
+
 ### Structured logging
 
 The backend uses `tracing` and `tracing-subscriber`. Logs go to stderr so they
@@ -149,7 +209,10 @@ effects.
 
 Unit tests cover configuration validation and disk round-tripping, error
 sanitization, module status reporting, input validation, and the `ping` command.
-Run them with:
+Database tests cover initial creation, reopening with persisted preferences,
+migration output, corrupt-file recovery, catalog read-only access, missing
+catalog degradation, bundled/user separation, and the parameterized diagnostic
+query. Run them with:
 
 ```powershell
 cargo test --all-targets
@@ -163,7 +226,7 @@ directly without a webview.
 - No hardware enumeration, WMI queries, or SetupAPI calls.
 - No driver matching, manufacturer integrations, or source scraping.
 - No network requests, downloads, or installers.
-- No database connection or schema yet.
+- No real catalog hardware or driver rows yet; only schema and metadata ship.
 - No Tauri events; commands return values only.
 
 These are boundaries, not placeholders for hidden behavior.

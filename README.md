@@ -3,8 +3,9 @@
 **Open Driver** — an open-source Windows utility for identifying computer hardware, discovering
 compatible drivers, and providing downloads from official manufacturer sources.
 
-> Status: **Phase 2 — backend architecture.** Hardware detection, driver lookup, downloads, and
-> installations are intentionally not implemented yet. See
+> Status: **Phase 3 — embedded database.** SQLite runs inside the Rust backend with a read-only
+> bundled driver catalog and a separate writable user database. Hardware detection, driver lookup,
+> downloads, and installations are intentionally not implemented yet. See
 > [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) for the backend design.
 
 ## Stack
@@ -14,6 +15,7 @@ compatible drivers, and providing downloads from official manufacturer sources.
 | Desktop  | Tauri 2 (WebView2)                            |
 | Backend  | Rust (stable, MSVC toolchain)                 |
 | Frontend | React 19 + TypeScript 6 (strict mode)         |
+| Database | SQLite via SQLx 0.8 (bundled, no server)      |
 | Bundler  | Vite 8                                        |
 | Styling  | Tailwind CSS 4                                |
 | Icons    | Lucide React                                  |
@@ -83,7 +85,7 @@ Release artifacts are written under
 │   ├── src/hardware/         Hardware identification boundary
 │   ├── src/drivers/          Driver discovery boundary
 │   ├── src/sources/          Official source registry boundary
-│   ├── src/database/         Local persistence boundary
+│   ├── src/database/         Embedded SQLite: user database and bundled catalog
 │   ├── src/downloads/        Download orchestration boundary
 │   ├── src/platform/         Platform helpers and Windows-only integration
 │   ├── src/config.rs         Typed configuration and validation
@@ -91,6 +93,9 @@ Release artifacts are written under
 │   ├── src/logging.rs        Structured logging setup
 │   ├── src/state.rs          Central application state
 │   ├── src/utils/            Shared validation helpers
+│   ├── migrations/           Versioned user-database migrations
+│   ├── resources/catalog/    Catalog schema and read-only SQLite snapshot
+│   ├── examples/             Maintenance tools (catalog regeneration)
 │   ├── ARCHITECTURE.md       Backend design and decisions
 │   ├── capabilities/         Tauri 2 window capabilities
 │   ├── icons/                Windows icon assets
@@ -134,6 +139,8 @@ macro_rules! generate_command_handlers {
     () => {
         tauri::generate_handler![
             $crate::commands::app::get_app_info,
+            $crate::commands::database::database_test_query,
+            $crate::commands::database::get_database_health,
             $crate::commands::system::get_backend_status,
             $crate::commands::system::ping,
         ]
@@ -150,6 +157,80 @@ is a harmless round-trip command that demonstrates input validation and typed er
 
 Errors cross the IPC boundary as `{ code, message }`. Internal details (paths, OS errors) are
 logged with `tracing` and never exposed to the webview.
+
+## Embedded database
+
+OpenDrvr uses embedded SQLite through SQLx 0.8 with the bundled SQLite build. No external database
+server or user setup is required. All SQL stays inside Rust; React only calls typed commands and
+never receives a connection or executes a query.
+
+The database is split into two independent components:
+
+| Component              | Location                                                       | Access    | Purpose                                                                     |
+| ---------------------- | -------------------------------------------------------------- | --------- | --------------------------------------------------------------------------- |
+| User database          | `%APPDATA%\com.opendrvr.desktop\opendrvr.sqlite3`              | Writable  | Preferences, configuration, scan history, download history, cached metadata |
+| Bundled driver catalog | `<install>\resources\catalog\catalog.sqlite3` (Tauri resource) | Read-only | Hardware identifiers, manufacturers, driver metadata, official sources      |
+
+The user database file name is configurable through `database.fileName` but is always resolved
+inside Tauri's per-user app data directory. It survives application upgrades and is never touched
+by catalog updates.
+
+### Schemas
+
+User database (migrations `0001_user_initial.sql` and `0002_user_configuration.sql`, schema
+version 2):
+
+- `app_preferences` — key/value preferences with update timestamps.
+- `hardware_scans` — scan runs with status and summary.
+- `hardware_scan_devices` — per-scan PCI/USB devices and optional details.
+- `download_history` — download attempts, progress and outcome.
+- `cached_driver_metadata` — cached driver payloads with expiry and ETag.
+- `user_configuration` — structured JSON configuration documents.
+
+Bundled catalog (schema version 1, `resources/catalog/schema.sql`):
+
+- `catalog_meta` — catalog format and schema version.
+- `manufacturers` — vendor metadata.
+- `hardware_devices` — PCI/USB identifiers, subsystem IDs, class and revision.
+- `driver_sources` — official manufacturer/Windows Update/OEM sources.
+- `drivers` — driver name, version, release date, download metadata and checksum.
+- `driver_hardware` — driver-to-hardware matches.
+- `driver_windows_compat` — supported Windows versions and architectures (`x86`, `x64`, `arm64`).
+- `driver_source_refs` — official source URLs per driver.
+
+The shipped catalog contains schema and metadata only. Hardware and driver rows will be added when
+real catalog data is available; no records are invented. Future catalog updates should ship a new
+immutable snapshot, not mutate the installed file.
+
+### Initialization and recovery
+
+- User database: creates the directory and file, enables WAL, foreign keys, a 5-second busy
+  timeout and a bounded connection pool, then runs SQLx migrations and `PRAGMA quick_check`.
+  If initialization fails, the file (and `-wal`/`-shm` sidecars) is renamed to
+  `opendrvr.sqlite3.corrupt-<unix>` and a fresh database is created once.
+- Bundled catalog: opened with SQLite's `read_only` flag. A missing or broken catalog is logged and
+  reported through health checks; it does not prevent the application from starting.
+- Startup never crashes because a database is unavailable. The UI shows the affected component as
+  unavailable instead.
+
+### Commands
+
+- `get_database_health` — live status, schema version, table count, writability and catalog
+  manufacturer count.
+- `database_test_query` — harmless parameterized preference lookup that also reports catalog
+  availability. No SQL text is accepted from the frontend.
+
+### Regenerating the catalog
+
+After editing `src-tauri/resources/catalog/schema.sql`:
+
+```powershell
+cd src-tauri
+cargo run --example build_catalog
+```
+
+This rewrites `resources/catalog/catalog.sqlite3` from the schema. The generated file is bundled
+through `tauri.conf.json` as `catalog/catalog.sqlite3`.
 
 ## Windows x64 notes
 
