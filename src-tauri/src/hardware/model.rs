@@ -9,7 +9,8 @@ use serde::Serialize;
 use super::{
     category::DeviceCategory,
     id::{BusType, DeviceInstanceId, HardwareId},
-    status::DeviceStatus,
+    identify::DeviceIdentification,
+    status::{DeviceCondition, DeviceStatus},
 };
 
 /// One Plug and Play device instance.
@@ -24,6 +25,8 @@ pub struct DeviceRecord {
     pub compatible_ids: Vec<HardwareId>,
     pub bus_type: BusType,
     pub category: DeviceCategory,
+    /// Structured identity derived from the raw identifiers.
+    pub identification: DeviceIdentification,
     /// Windows device class, for example `Net` or `Display`.
     pub class_name: Option<String>,
     /// Windows device class GUID, formatted as a canonical UUID string.
@@ -39,6 +42,8 @@ pub struct DeviceRecord {
     pub driver: Option<DriverInfo>,
     pub status: DeviceStatus,
     pub is_present: bool,
+    /// Coarse classification combining presence, status, and driver metadata.
+    pub condition: DeviceCondition,
 }
 
 impl DeviceRecord {
@@ -84,7 +89,8 @@ pub struct DriverInfo {
     /// UTC timestamp formatted from `DEVPKEY_Device_DriverDate`.
     pub date: Option<String>,
     pub description: Option<String>,
-    pub inf_path: Option<String>,
+    /// INF file name reported by `DEVPKEY_Device_DriverInfPath`.
+    pub inf_name: Option<String>,
     pub service: Option<String>,
 }
 
@@ -152,6 +158,7 @@ mod tests {
             compatible_ids: Vec::new(),
             bus_type: BusType::Pci,
             category: DeviceCategory::Pci,
+            identification: DeviceIdentification::default(),
             class_name: Some("System".to_string()),
             class_guid: None,
             manufacturer: None,
@@ -163,6 +170,7 @@ mod tests {
             driver: None,
             status: DeviceStatus::from_flags(0, 0),
             is_present: true,
+            condition: DeviceCondition::MissingDriver,
         }
     }
 

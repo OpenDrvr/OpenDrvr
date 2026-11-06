@@ -134,6 +134,10 @@ impl HardwareId {
             HardwareIdKind::Pci(PciHardwareId::parse(rest))
         } else if let Some(rest) = strip_prefix_ignore_ascii_case(&raw, "USB\\") {
             HardwareIdKind::Usb(UsbHardwareId::parse(rest))
+        } else if let Some(rest) = strip_prefix_ignore_ascii_case(&raw, "ACPI\\") {
+            HardwareIdKind::Acpi(AcpiHardwareId::parse(rest))
+        } else if let Some(rest) = strip_prefix_ignore_ascii_case(&raw, "HDAUDIO\\") {
+            HardwareIdKind::Hdaudio(HdaudioHardwareId::parse(rest))
         } else {
             HardwareIdKind::Unknown
         };
@@ -151,6 +155,8 @@ impl HardwareId {
         match self.kind {
             HardwareIdKind::Pci(_) => BusType::Pci,
             HardwareIdKind::Usb(_) => BusType::Usb,
+            HardwareIdKind::Acpi(_) => BusType::Acpi,
+            HardwareIdKind::Hdaudio(_) => BusType::Audio,
             HardwareIdKind::Unknown => BusType::Unknown,
         }
     }
@@ -162,6 +168,8 @@ impl HardwareId {
 pub enum HardwareIdKind {
     Pci(PciHardwareId),
     Usb(UsbHardwareId),
+    Acpi(AcpiHardwareId),
+    Hdaudio(HdaudioHardwareId),
     Unknown,
 }
 
@@ -253,6 +261,115 @@ impl UsbHardwareId {
     }
 }
 
+/// Best-effort ACPI identifier fields.
+///
+/// ACPI hardware IDs use either `ACPI\VEN_vvvv&DEV_dddd` or a compact
+/// `ACPI\PNP0A08` / `ACPI\INT3450` / `ACPI\ACPI0003` form. The compact form is
+/// an EISA-style vendor prefix followed by a device identifier. The prefix is
+/// an ID namespace owner, not necessarily the device's manufacturer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpiHardwareId {
+    pub vendor_id: Option<String>,
+    pub device_id: Option<String>,
+}
+
+impl AcpiHardwareId {
+    fn parse(value: &str) -> Self {
+        let mut parsed = Self::default();
+
+        for token in value.split('&') {
+            let Some((key, value)) = token.split_once('_') else {
+                continue;
+            };
+
+            match key.to_ascii_uppercase().as_str() {
+                "VEN" => parsed.vendor_id = alphanumeric_field(value, 4),
+                "DEV" => parsed.device_id = alphanumeric_field(value, 4),
+                _ => {}
+            }
+        }
+
+        if parsed.vendor_id.is_none() && parsed.device_id.is_none() {
+            let value = value.trim();
+            if value.is_ascii()
+                && value.len() == 7
+                && value[..3]
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+                && value[3..]
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                parsed.vendor_id = Some(value[..3].to_ascii_uppercase());
+                parsed.device_id = Some(value.to_ascii_uppercase());
+            } else if value.is_ascii()
+                && value.len() == 8
+                && value[..4]
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+                && value[4..]
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                parsed.vendor_id = Some(value[..4].to_ascii_uppercase());
+                parsed.device_id = Some(value.to_ascii_uppercase());
+            } else if !value.is_empty() {
+                parsed.device_id = Some(value.to_ascii_uppercase());
+            }
+        }
+
+        parsed
+    }
+}
+
+/// Best-effort HD Audio identifier fields.
+///
+/// HD Audio hardware IDs use
+/// `HDAUDIO\FUNC_01&VEN_10EC&DEV_0256&SUBSYS_17AA2245&REV_1000`. Unlike PCI,
+/// the `SUBSYS` field lists the subsystem vendor first, then the subsystem
+/// device.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HdaudioHardwareId {
+    pub function_group: Option<String>,
+    pub vendor_id: Option<String>,
+    pub device_id: Option<String>,
+    pub subsystem_vendor_id: Option<String>,
+    pub subsystem_device_id: Option<String>,
+    pub revision: Option<String>,
+}
+
+impl HdaudioHardwareId {
+    fn parse(value: &str) -> Self {
+        let mut parsed = Self::default();
+
+        for token in value.split('&') {
+            let Some((key, value)) = token.split_once('_') else {
+                continue;
+            };
+
+            match key.to_ascii_uppercase().as_str() {
+                "FUNC" => parsed.function_group = hex_field(value, 2),
+                "VEN" => parsed.vendor_id = hex_field(value, 4),
+                "DEV" => parsed.device_id = hex_field(value, 4),
+                "SUBSYS" => {
+                    if value.len() == 8
+                        && value.chars().all(|character| character.is_ascii_hexdigit())
+                    {
+                        parsed.subsystem_vendor_id = Some(value[..4].to_ascii_uppercase());
+                        parsed.subsystem_device_id = Some(value[4..].to_ascii_uppercase());
+                    }
+                }
+                "REV" => parsed.revision = hex_field(value, 4),
+                _ => {}
+            }
+        }
+
+        parsed
+    }
+}
+
 fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     value
         .get(..prefix.len())
@@ -263,6 +380,18 @@ fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'
 fn hex_field(value: &str, expected_length: usize) -> Option<String> {
     if value.len() == expected_length
         && value.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        Some(value.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+fn alphanumeric_field(value: &str, expected_length: usize) -> Option<String> {
+    if value.len() == expected_length
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
     {
         Some(value.to_ascii_uppercase())
     } else {
@@ -328,6 +457,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_acpi_compact_and_ven_dev_identifiers() {
+        let compact = HardwareId::parse(r"ACPI\PNP0A08");
+        let HardwareIdKind::Acpi(ref acpi) = compact.kind else {
+            panic!("expected ACPI identifier");
+        };
+        assert_eq!(acpi.vendor_id.as_deref(), Some("PNP"));
+        assert_eq!(acpi.device_id.as_deref(), Some("PNP0A08"));
+        assert_eq!(compact.bus_type(), BusType::Acpi);
+
+        let four_letter = HardwareId::parse(r"ACPI\ACPI0003");
+        let HardwareIdKind::Acpi(acpi) = four_letter.kind else {
+            panic!("expected ACPI identifier");
+        };
+        assert_eq!(acpi.vendor_id.as_deref(), Some("ACPI"));
+        assert_eq!(acpi.device_id.as_deref(), Some("ACPI0003"));
+
+        let ven_dev = HardwareId::parse(r"ACPI\VEN_INTC&DEV_0A08");
+        let HardwareIdKind::Acpi(acpi) = ven_dev.kind else {
+            panic!("expected ACPI identifier");
+        };
+        assert_eq!(acpi.vendor_id.as_deref(), Some("INTC"));
+        assert_eq!(acpi.device_id.as_deref(), Some("0A08"));
+    }
+
+    #[test]
+    fn parses_hdaudio_codec_and_subsystem_fields() {
+        let id = HardwareId::parse(r"HDAUDIO\FUNC_01&VEN_10EC&DEV_0256&SUBSYS_17AA2245&REV_1000");
+
+        assert_eq!(id.bus_type(), BusType::Audio);
+        let HardwareIdKind::Hdaudio(hdaudio) = id.kind else {
+            panic!("expected HD Audio identifier");
+        };
+        assert_eq!(hdaudio.function_group.as_deref(), Some("01"));
+        assert_eq!(hdaudio.vendor_id.as_deref(), Some("10EC"));
+        assert_eq!(hdaudio.device_id.as_deref(), Some("0256"));
+        assert_eq!(hdaudio.subsystem_vendor_id.as_deref(), Some("17AA"));
+        assert_eq!(hdaudio.subsystem_device_id.as_deref(), Some("2245"));
+        assert_eq!(hdaudio.revision.as_deref(), Some("1000"));
+    }
+
+    #[test]
     fn preserves_malformed_and_unknown_identifiers() {
         let malformed = HardwareId::parse(r"PCI\VEN_ZZZZ&DEV_1234");
         assert_eq!(malformed.as_str(), r"PCI\VEN_ZZZZ&DEV_1234");
@@ -337,8 +507,8 @@ mod tests {
         assert_eq!(pci.vendor_id, None);
         assert_eq!(pci.device_id.as_deref(), Some("1234"));
 
-        let unknown = HardwareId::parse(r"ACPI\PNP0A08");
-        assert_eq!(unknown.as_str(), r"ACPI\PNP0A08");
+        let unknown = HardwareId::parse(r"SWD\MMDEVAPI\AudioEndpoint");
+        assert_eq!(unknown.as_str(), r"SWD\MMDEVAPI\AudioEndpoint");
         assert_eq!(unknown.kind, HardwareIdKind::Unknown);
         assert_eq!(unknown.bus_type(), BusType::Unknown);
     }

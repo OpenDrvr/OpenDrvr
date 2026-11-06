@@ -115,8 +115,8 @@ mod tests {
             .filter(|status| status.state == ModuleState::Unavailable)
             .count();
 
-        assert_eq!(planned, 3);
-        assert_eq!(ready, 1);
+        assert_eq!(planned, 2);
+        assert_eq!(ready, 2);
         assert_eq!(unavailable, 1);
     }
 }

@@ -1,18 +1,17 @@
 # Windows hardware integration
 
-This document describes the native hardware layer prepared in **Phase 6**. It
+This document describes the native hardware layer implemented in **Phase 9**. It
 records the Windows API assessment, the portable data model, the provider
-architecture, privilege and compatibility expectations, and the plan for the
-Phase 7 scanner.
+architecture, privilege and compatibility expectations, and the boundary before
+driver catalog matching.
 
-Phase 6 deliberately stops short of a user-facing scan. There is no IPC command,
-no frontend hardware data, no catalog matching, and no driver download or
-installation. The hardware module remains `Planned`; only the native enumeration
-layer and its tests exist.
+Phase 9 exposes a read-only scan through the `scan_hardware` command and the
+Hardware page. It does not persist scans, match devices against the catalog,
+download drivers, or install anything.
 
 ## Goals and boundaries
 
-The future scanner must identify at least:
+The scanner identifies at least:
 
 - CPU and GPU devices
 - motherboard and chipset devices
@@ -23,15 +22,14 @@ The future scanner must identify at least:
 - devices Windows cannot classify
 - devices with missing, failed, or blocked drivers
 
-Identity must come from Plug and Play data, not from friendly names. The raw
-device instance ID and hardware IDs are authoritative. PCI and USB parsing is a
+Identity comes from Plug and Play data, not from friendly names. The raw device
+instance ID and hardware IDs are authoritative. PCI and USB parsing is a
 convenience for matching and presentation; an unrecognized or malformed string
 is always preserved verbatim.
 
-Phase 6 does **not**:
+Phase 9 does **not**:
 
-- expose a `scan_hardware` command
-- render hardware data in React
+- persist scans or scan history
 - match devices against the catalog
 - query WMI/CIM
 - inspect or install driver packages
@@ -40,7 +38,7 @@ Phase 6 does **not**:
 
 ## Windows API assessment
 
-| API                                                   | Role                                              | Strengths                                                                                                                                                                    | Limits                                                                                                                             | Phase 6 decision                                                   |
+| API                                                   | Role                                              | Strengths                                                                                                                                                                    | Limits                                                                                                                             | Phase 9 decision                                                   |
 | ----------------------------------------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
 | Configuration Manager (`cfgmgr32.dll`)                | Primary PnP device tree access                    | Machine-wide enumeration without class GUIDs; device instance IDs; status flags and problem codes; typed device properties; parent/child relationships; notification support | Lower-level than SetupAPI; driver-package/INF details are limited; some properties are unavailable to standard users               | **Used now** for enumeration, status, and device/driver properties |
 | SetupAPI (`setupapi.dll`)                             | Device sets, registry properties, driver packages | Class/group enumeration; `SetupDiGetDeviceRegistryProperty`; driver info lists; INF inspection; installation APIs                                                            | Requires an `HDEVINFO` set and often a class GUID; older property model; driver-store/install operations need administrator rights | **Reserved** for future driver-package and INF inspection          |
@@ -53,8 +51,10 @@ CfgMgr32 exposes the device tree directly and does not require the caller to
 enumerate class GUIDs first. It provides:
 
 - `CM_Get_Device_ID_List_SizeW` and `CM_Get_Device_ID_ListW` to list device
-  instance IDs, with `CM_GETIDLIST_FILTER_PRESENT` for the current tree
-- `CM_Locate_DevNodeW` to obtain a device node handle
+  instance IDs, with `CM_GETIDLIST_FILTER_NONE` for all installed nodes and
+  `CM_GETIDLIST_FILTER_PRESENT` available when only the current tree is needed
+- `CM_Locate_DevNodeW` to obtain a device node handle, with
+  `CM_LOCATE_DEVNODE_PHANTOM` for installed but non-present devices
 - `CM_Get_DevNode_Status` for `DN_*` flags and `CM_PROB_*` problem codes
 - `CM_Get_DevNode_PropertyW` for typed `DEVPKEY_Device_*` properties
 - `CM_Get_Parent`, `CM_Get_Child`, and `CM_Get_Sibling` for tree traversal if a
@@ -64,7 +64,7 @@ SetupAPI remains valuable later because it is the documented path for driver
 information lists and INF/package inspection. Keeping the provider boundary
 narrow means the scanner can add SetupAPI without changing the portable model.
 
-### Property keys used in Phase 6
+### Property keys used in Phase 9
 
 | Area           | Property                                                                                                                                                                            |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -82,11 +82,14 @@ the key returned by the list call.
 ## Architecture
 
 ```text
-AppState
-  └── HardwareService
-        └── Arc<dyn DeviceEnumerator>        portable hardware::provider trait
-              └── WindowsDeviceEnumerator    platform::windows::device_tree
-                    └── CfgMgr32             cfgmgr32.dll through windows-rs
+React useHardwareScan
+  └── invokeCommand("scan_hardware")
+        └── commands::hardware::scan_hardware
+              └── spawn_blocking
+                    └── HardwareService
+                          └── Arc<dyn DeviceEnumerator>        portable hardware::provider trait
+                                └── WindowsDeviceEnumerator    platform::windows::device_tree
+                                      └── CfgMgr32             cfgmgr32.dll through windows-rs
 ```
 
 - `hardware/` owns the portable model, identifier parsing, status mapping,
@@ -99,28 +102,37 @@ AppState
   code. A future test or alternate provider can implement `DeviceEnumerator`
   without a Windows device tree.
 
-`HardwareService::scan()` exists for internal use and tests, but it is not
-registered as an IPC command. The module status stays `Planned` with a message
-that the scan is scheduled for Phase 7.
+`HardwareService::scan()` runs on a blocking worker because Configuration
+Manager calls are synchronous. The module status is `Ready`. Scans are returned
+directly to the caller and are not persisted.
 
 ### Enumeration flow
 
 1. Query the required UTF-16 buffer size with
-   `CM_Get_Device_ID_List_SizeW(NULL, CM_GETIDLIST_FILTER_PRESENT)`.
+   `CM_Get_Device_ID_List_SizeW(NULL, CM_GETIDLIST_FILTER_NONE)`.
 2. Read the multi-string device ID list with `CM_Get_Device_ID_ListW`. A
    `CR_BUFFER_SMALL` result is retried a bounded number of times because the
    device tree can change between the size query and the read.
-3. For each instance ID, locate the device node with `CM_Locate_DevNodeW`.
-4. Read status and problem code with `CM_Get_DevNode_Status`.
-5. Read each optional property with a size query followed by a typed read.
+3. Deduplicate instance IDs case-insensitively while preserving Windows order.
+4. For each instance ID, locate the device node with
+   `CM_Locate_DevNodeW(CM_LOCATE_DEVNODE_NORMAL)`. If that fails, retry with
+   `CM_LOCATE_DEVNODE_PHANTOM` so installed but disconnected devices are still
+   reported.
+5. Read presence first, then status and problem code with
+   `CM_Get_DevNode_Status`.
+6. Read each optional property with a size query followed by a typed read.
    Missing values (`CR_NO_SUCH_VALUE`) are normal and are not diagnostics.
-6. Emit one `DeviceRecord` per device, then sort by instance ID for deterministic
-   output.
+7. Derive `DeviceCondition` from presence, status, problem kind, and driver
+   metadata.
+8. Emit one `DeviceRecord` per device, sort by instance ID, and deduplicate once
+   more for deterministic output.
 
 Only failure to obtain the device ID list is fatal. A device that cannot be
 located, or whose status cannot be read, is recorded in diagnostics while the
-rest of the scan continues. A property with an unexpected type or malformed
-payload is recorded as a property failure and left unset.
+rest of the scan continues. Property failures for non-present devices are not
+treated as warnings because those devices are expected to expose fewer
+properties. A property with an unexpected type or malformed payload is recorded
+as a property failure and left unset.
 
 ## Portable data model
 
@@ -176,24 +188,35 @@ class and PCI class code, never from the friendly name:
 - unknown
 
 `Motherboard` is reserved in the model. The PnP class `System` is too broad to
-identify a board reliably, so Phase 7 will supply board identity from
-`Win32_BaseBoard` and treat it as supplemental data rather than a PnP category.
+identify a board reliably, so board identity will be supplied later from
+`Win32_BaseBoard` and treated as supplemental data rather than a PnP category.
 
 ### Device record and snapshot
 
 `DeviceRecord` carries the instance ID, ordered hardware and compatible IDs, bus
 type, category, class name and GUID, manufacturer, friendly name, device
 description, enumerator, parent instance ID, location facts, driver facts,
-status, and presence flag.
+status, presence flag, and a coarse `DeviceCondition`.
 
-`DriverInfo` carries provider, version, date (UTC), description, INF path, and
-service name. It is descriptive metadata only; it does not imply that an update
-exists.
+`DeviceCondition` is the UI-facing classification:
+
+- `healthy` — present and started or driver-loaded
+- `disabled` — present and disabled by Windows
+- `problem` — present with a non-driver error
+- `missing-driver` — present with an install/load/block/signature problem, or
+  stopped without driver metadata
+- `non-present` — installed but not connected
+- `unknown` — presence or status could not be determined
+
+`DriverInfo` carries provider, version, date (UTC), description, INF file name,
+and service name. `DEVPKEY_Device_DriverInfPath` returns an INF file name, not a
+full path, so the field is named `inf_name`. It is descriptive metadata only; it
+does not imply that an update exists.
 
 `HardwareSnapshot` contains the device records and `ScanDiagnostics`:
 
 - provider name (`CfgMgr32`)
-- whether only present devices were enumerated
+- whether only present devices were enumerated (false in Phase 9)
 - device count and duration
 - per-property failures
 - per-device failures
@@ -204,7 +227,7 @@ Enumeration and property reads are designed to work for a standard user.
 Windows may deny specific properties; those are degraded to diagnostics rather
 than failing the scan.
 
-Administrator rights are expected for operations that Phase 6 does not perform:
+Administrator rights are expected for operations that Phase 9 does not perform:
 
 - installing, updating, or removing driver packages
 - writing to the driver store or protected registry keys
@@ -221,9 +244,11 @@ separately gated action with signature verification and rollback.
 - CfgMgr32 is available on all supported Windows versions.
 - Unified device properties (`CM_Get_DevNode_PropertyW`) are available since
   Windows Vista.
-- `CM_GETIDLIST_FILTER_PRESENT` is available since Windows 7.
+- `CM_GETIDLIST_FILTER_PRESENT` is available since Windows 7; Phase 9 uses
+  `CM_GETIDLIST_FILTER_NONE` and `CM_LOCATE_DEVNODE_PHANTOM` to include
+  non-present devices.
 - `DEVPKEY_Device_ProblemStatus` is available since Windows 8; it is not used
-  yet because Phase 6 reads the problem code from `CM_Get_DevNode_Status`.
+  yet because the provider reads the problem code from `CM_Get_DevNode_Status`.
 - The `windows` crate is a Windows-only dependency. Non-Windows builds and
   non-x64 Windows builds use `UnsupportedDeviceEnumerator` and return
   `HardwareError::UnsupportedPlatform`.
@@ -239,13 +264,13 @@ windows = { version = "0.62.2", features = [
 ] }
 ```
 
-No WMI, SetupAPI, registry, or driver-installation crate is added in Phase 6.
+No WMI, SetupAPI, registry, or driver-installation crate is added in Phase 9.
 
 ## Missing drivers and unknown devices
 
 A device with no driver metadata still produces a record. Its raw hardware IDs
-and instance ID remain available for matching, and its status exposes the
-problem:
+and instance ID remain available for matching, and its condition and status
+expose the problem:
 
 - `CM_PROB_NOT_CONFIGURED` — no configuration exists
 - `CM_PROB_FAILED_INSTALL` — installation failed
@@ -254,6 +279,11 @@ problem:
 - `CM_PROB_DRIVER_BLOCKED` — driver blocked by policy
 - `CM_PROB_UNSIGNED_DRIVER` — unsigned driver
 - `CM_PROB_DEVICE_NOT_THERE` — device is not present
+
+Install, load, block, and signature failures map to `missing-driver`. Other
+present failures map to `problem`, and disabled nodes map to `disabled`.
+Non-present nodes are always `non-present`, even when the status call also
+reports a problem code.
 
 Devices with no hardware IDs, such as some root or ACPI nodes, are still
 recorded with empty identifier lists. They are not dropped or fabricated.
@@ -269,7 +299,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 ```
 
-Coverage in Phase 6:
+Coverage in Phase 9:
 
 - PCI hardware ID parsing, including subsystem order and class codes
 - USB hardware ID parsing, including interface and class triplets
@@ -279,47 +309,44 @@ Coverage in Phase 6:
 - status mapping for started, driver-loaded, stopped, disabled, problem, and
   unknown states
 - `CM_PROB_*` mapping, including unknown codes
+- condition classification for healthy, disabled, missing-driver, problem,
+  non-present, and unknown devices
 - category classification from class names and PCI class codes
 - snapshot lookup and display-name fallback
 - provider injection and unsupported-platform errors
+- command error sanitization for hardware failures
 - multi-string decoding, GUID formatting, and FILETIME conversion
-- a real-hardware test that enumerates the local present device tree and checks
-  snapshot invariants
+- case-insensitive instance-ID deduplication
+- a real-hardware test that enumerates the local device tree, checks snapshot
+  invariants, and asserts that non-present devices have the matching condition
 
 The provider trait allows service tests to use a fake enumerator, so domain
 behavior does not require a live device tree.
 
-## Phase 7 plan
+## Next-phase boundary
 
-1. **Expose a typed scan command.** Add `scan_hardware` returning a serializable
-   DTO derived from `HardwareSnapshot`, register it in the command macro, and
-   add a typed frontend wrapper. The Hardware page then renders real records,
-   with explicit loading, empty, and error states.
-2. **Persist scans.** Use the existing `hardware_scans` and
+1. **Persist scans.** Use the existing `hardware_scans` and
    `hardware_scan_devices` tables. Add a migration only if the richer model
    needs fields the current schema lacks: raw compatible IDs, driver provider and
    version, problem code, category, bus type, and location facts.
-3. **Match the catalog.** Match exact hardware IDs first, then compatible IDs,
+2. **Match the catalog.** Match exact hardware IDs first, then compatible IDs,
    then conservative class fallbacks. Never match by friendly name. Keep the
    catalog schema's PCI/USB fields aligned with `HardwareId`.
-4. **Add WMI/CIM as supplemental data.** Use `Win32_Processor`,
+3. **Add WMI/CIM as supplemental data.** Use `Win32_Processor`,
    `Win32_VideoController`, `Win32_BaseBoard`, `Win32_BIOS`,
    `Win32_ComputerSystem`, `Win32_PhysicalMemory`, and
    `Win32_NetworkAdapter` for facts PnP does not expose cleanly, such as CPU
    model and cores, GPU memory, board model, BIOS version, and memory modules.
    PnP identity remains authoritative.
-5. **Add read-only SetupAPI inspection.** Use driver information lists and INF
+4. **Add read-only SetupAPI inspection.** Use driver information lists and INF
    metadata to enrich provider/version/date facts and to explain missing
    drivers. Do not install or modify anything in this step.
-6. **Add diagnostics and refresh.** Surface scan duration, degraded properties,
-   and failures in a developer-facing diagnostics view. Add a manual refresh and
-   a cached snapshot.
-7. **Defer installation.** Driver download, signature verification, install,
+5. **Defer installation.** Driver download, signature verification, install,
    rollback, and elevation belong to a later phase. They must be explicit,
    auditable, and separate from scanning.
 
 ## Licensing
 
-The Phase 6 code remains part of OpenDrvr and is licensed under **AGPL-3.0**.
+The Phase 9 code remains part of OpenDrvr and is licensed under **AGPL-3.0**.
 No third-party source was copied. The `windows` crate is used under its
 upstream MIT/Apache-2.0 license and is linked as a normal dependency.

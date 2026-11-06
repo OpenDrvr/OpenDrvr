@@ -32,6 +32,64 @@ pub enum DeviceState {
     Unknown,
 }
 
+/// Coarse, user-facing condition of a device.
+///
+/// This combines presence, lifecycle state, problem code, and driver metadata so
+/// the scanner and the UI classify a device the same way. The raw status and
+/// problem code remain available on [`DeviceStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeviceCondition {
+    /// Present and usable without a reported problem.
+    Healthy,
+    /// Present but Windows reports the device as disabled.
+    Disabled,
+    /// Present with a non-driver error.
+    Problem,
+    /// Present, but no usable driver is installed.
+    MissingDriver,
+    /// Installed in the registry but not currently connected.
+    NonPresent,
+    /// Presence or status could not be determined.
+    Unknown,
+}
+
+impl DeviceCondition {
+    /// Classifies a device without hiding the underlying status details.
+    ///
+    /// `has_driver` means at least one driver metadata property was reported.
+    /// A started device without metadata is still treated as healthy because
+    /// Windows does not expose driver properties for every functional device.
+    pub fn classify(is_present: bool, status: &DeviceStatus, has_driver: bool) -> Self {
+        if !is_present {
+            return Self::NonPresent;
+        }
+
+        match status.state {
+            DeviceState::Unknown => Self::Unknown,
+            DeviceState::Disabled => Self::Disabled,
+            DeviceState::Problem => match status.problem.map(|problem| problem.kind) {
+                Some(
+                    ProblemKind::FailedInstall
+                    | ProblemKind::NeedsReinstall
+                    | ProblemKind::DriverLoadFailed
+                    | ProblemKind::DriverBlocked
+                    | ProblemKind::DriverUnsigned,
+                ) => Self::MissingDriver,
+                _ => Self::Problem,
+            },
+            DeviceState::Stopped => {
+                if has_driver {
+                    Self::Problem
+                } else {
+                    Self::MissingDriver
+                }
+            }
+            DeviceState::Started | DeviceState::DriverLoaded => Self::Healthy,
+        }
+    }
+}
+
 /// A Configuration Manager problem code with a stable, coarse classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -236,5 +294,71 @@ mod tests {
         let status = DeviceStatus::from_flags(DN_STARTED | DN_NEED_RESTART, 0);
 
         assert!(status.needs_restart());
+    }
+
+    #[test]
+    fn classifies_non_present_devices_before_status() {
+        let status = DeviceStatus::from_flags(DN_HAS_PROBLEM, 24);
+
+        assert_eq!(
+            DeviceCondition::classify(false, &status, true),
+            DeviceCondition::NonPresent
+        );
+    }
+
+    #[test]
+    fn classifies_healthy_and_disabled_devices() {
+        let started = DeviceStatus::from_flags(DN_STARTED | DN_DRIVER_LOADED, 0);
+        let disabled = DeviceStatus::from_flags(DN_HAS_PROBLEM, CM_PROB_DISABLED);
+
+        assert_eq!(
+            DeviceCondition::classify(true, &started, true),
+            DeviceCondition::Healthy
+        );
+        assert_eq!(
+            DeviceCondition::classify(true, &started, false),
+            DeviceCondition::Healthy
+        );
+        assert_eq!(
+            DeviceCondition::classify(true, &disabled, true),
+            DeviceCondition::Disabled
+        );
+    }
+
+    #[test]
+    fn separates_missing_drivers_from_other_problems() {
+        let failed_install = DeviceStatus::from_flags(DN_HAS_PROBLEM, 28);
+        let unsigned = DeviceStatus::from_flags(DN_HAS_PROBLEM, 52);
+        let failed_start = DeviceStatus::from_flags(DN_HAS_PROBLEM, 10);
+        let stopped = DeviceStatus::from_flags(0, 0);
+
+        assert_eq!(
+            DeviceCondition::classify(true, &failed_install, false),
+            DeviceCondition::MissingDriver
+        );
+        assert_eq!(
+            DeviceCondition::classify(true, &unsigned, false),
+            DeviceCondition::MissingDriver
+        );
+        assert_eq!(
+            DeviceCondition::classify(true, &failed_start, true),
+            DeviceCondition::Problem
+        );
+        assert_eq!(
+            DeviceCondition::classify(true, &stopped, false),
+            DeviceCondition::MissingDriver
+        );
+        assert_eq!(
+            DeviceCondition::classify(true, &stopped, true),
+            DeviceCondition::Problem
+        );
+    }
+
+    #[test]
+    fn classifies_unknown_status() {
+        assert_eq!(
+            DeviceCondition::classify(true, &DeviceStatus::unknown(), false),
+            DeviceCondition::Unknown
+        );
     }
 }

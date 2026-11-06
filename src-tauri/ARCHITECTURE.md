@@ -1,13 +1,13 @@
 # OpenDrvr backend architecture
 
-This document describes the Rust backend as of **Phase 6**. The structure is
+This document describes the Rust backend as of **Phase 10**. The structure is
 intentionally conservative: it reserves clear module boundaries without adding
-abstractions that the application does not need yet. Phase 6 added a portable
-hardware model and a Windows Plug and Play enumerator built on CfgMgr32. The
-scan is not exposed to the frontend yet, and driver discovery, manufacturer
-integrations, downloads, and installations remain **not** implemented. See
-[`HARDWARE_INTEGRATION.md`](HARDWARE_INTEGRATION.md) for the API assessment and
-the Phase 7 plan.
+abstractions that the application does not need yet. Phase 10 builds identifier
+parsing, vendor resolution, and device classification on top of the Windows Plug
+and Play enumerator exposed through `scan_hardware`. Driver catalog matching,
+manufacturer integrations, downloads, and installations remain **not**
+implemented. See [`HARDWARE_INTEGRATION.md`](HARDWARE_INTEGRATION.md) for the API
+assessment and the catalog-matching boundary.
 
 ## Layout
 
@@ -24,12 +24,15 @@ src-tauri/src/
 │   ├── mod.rs           Command exports and the single registration macro
 │   ├── app.rs           get_app_info
 │   ├── database.rs      get_database_health
+│   ├── hardware.rs      scan_hardware
 │   ├── preferences.rs   get_preferences, update_preferences, reset_preferences
 │   └── system.rs        get_backend_status
 ├── hardware/
 │   ├── mod.rs           Hardware service and provider injection
-│   ├── id.rs            Device instance IDs, bus types, PCI/USB identifiers
-│   ├── status.rs        Device state and CM_PROB mapping
+│   ├── id.rs            Device instance IDs, bus types, PCI/USB/ACPI/HDAUDIO identifiers
+│   ├── identify.rs      Identifier-based identity, confidence, and conflict notes
+│   ├── vendors.rs       Curated PCI/USB/ACPI/HDAUDIO vendor tables
+│   ├── status.rs        Device state, condition, and CM_PROB mapping
 │   ├── category.rs      Conservative device categorization
 │   ├── model.rs         Portable device, driver, location, snapshot models
 │   └── provider.rs      DeviceEnumerator trait and typed errors
@@ -59,7 +62,7 @@ src-tauri/
 ├── resources/catalog/schema.sql           Catalog schema source
 ├── resources/catalog/catalog.sqlite3      Generated read-only snapshot
 ├── examples/build_catalog.rs              Catalog regeneration tool
-└── HARDWARE_INTEGRATION.md                 Windows API assessment and Phase 7 plan
+└── HARDWARE_INTEGRATION.md                 Windows API assessment and hardware design
 ```
 
 Each directory is a Rust module with its own `mod.rs`. Keeping a directory
@@ -115,10 +118,12 @@ Discard, and Restore defaults actions.
 
 The frontend never receives a SQL connection or SQL text. It sees only the IPC
 DTOs defined in `commands/` and `database/models.rs`, which use camelCase Serde
-fields. The Hardware page renders a planned empty state even though the native
-enumeration layer is prepared; the scan command and UI land in Phase 7. Driver
-and download pages remain planned. They do not synthesize device or transfer
-data.
+fields. The Hardware page calls `scan_hardware` through `useHardwareScan`, which
+exposes loading, ready, and error states and guards against an older scan
+overwriting a newer refresh. The page renders only snapshot values, with search,
+category and condition filters, summary counts, and a device detail panel.
+Driver and download pages remain planned. They do not synthesize device or
+transfer data.
 
 The desktop shell uses hash navigation and a custom component library rather
 than a router or a UI framework. This keeps the webview dependency surface small
@@ -137,9 +142,9 @@ its own synchronization primitive rather than making the entire state mutable.
 ### Typed errors, sanitized IPC boundary
 
 Internal code returns `AppResult<T>` with `AppError`. Variants distinguish
-configuration, I/O, serialization, validation, database, and internal failures.
-Detailed messages may contain paths or OS error strings, so they are logged with
-`tracing` and never sent to the webview.
+configuration, I/O, serialization, validation, database, hardware, and internal
+failures. Detailed messages may contain paths or OS error strings, so they are
+logged with `tracing` and never sent to the webview.
 
 Tauri commands return `CommandResult<T>`. `CommandError` contains only a stable
 machine-readable `code` and a fixed public `message`. This gives the frontend
@@ -265,15 +270,15 @@ All commands are listed once in the `generate_command_handlers!` macro in
 macro entry, which makes omissions visible in review.
 
 The registered surface is intentionally narrow: application info, backend
-status, database health, and the three preference operations. The earlier
-`ping` and `database_test_query` diagnostics were removed once real preference
-commands replaced them.
+status, database health, hardware scanning, and the three preference operations.
+The earlier `ping` and `database_test_query` diagnostics were removed once real
+preference commands replaced them.
 
 ### Windows hardware enumeration
 
-Phase 6 introduces the native hardware layer without exposing it to the UI.
-CfgMgr32 is the primary provider because it enumerates the present Plug and Play
-tree without class GUIDs and returns authoritative instance IDs, status flags,
+Phase 10 exposes the native hardware layer through `scan_hardware`. CfgMgr32 is
+the primary provider because it enumerates the installed Plug and Play tree
+without class GUIDs and returns authoritative instance IDs, status flags,
 problem codes, and typed device properties. SetupAPI is reserved for future
 read-only driver-package and INF inspection, and WMI/CIM for supplemental
 CPU/GPU/motherboard/BIOS/memory facts.
@@ -284,17 +289,43 @@ only module that calls CfgMgr32. `AppState` injects the platform enumerator into
 `HardwareService`, inverting the dependency so tests and future providers can
 supply a fake.
 
-Enumeration is present-only (`CM_GETIDLIST_FILTER_PRESENT`). Only failure to read
-the device ID list is fatal; per-device and per-property failures degrade into
-`ScanDiagnostics` while the rest of the snapshot is returned. Raw instance IDs
-and hardware IDs are authoritative; PCI/USB parsing is best-effort and malformed
-identifiers are preserved verbatim. Devices with no driver metadata, no hardware
-IDs, or an unknown problem code are still recorded.
+Enumeration covers all installed device nodes (`CM_GETIDLIST_FILTER_NONE`).
+Present nodes are located with `CM_LOCATE_DEVNODE_NORMAL`; non-present nodes fall
+back to `CM_LOCATE_DEVNODE_PHANTOM`. Instance IDs are deduplicated
+case-insensitively and sorted before the snapshot is returned. Only failure to
+read the device ID list is fatal; per-device and per-property failures degrade
+into `ScanDiagnostics` while the rest of the snapshot is returned. Raw instance
+IDs and hardware IDs are authoritative; identifier parsing is best-effort and
+malformed identifiers are preserved verbatim. Devices with no driver metadata,
+no hardware IDs, or an unknown problem code are still recorded.
 
-`HardwareService::scan()` exists but is not registered as a command. No scan is
-persisted, no catalog match is attempted, and the module remains `Planned`.
-Phase 7 will add the IPC command, UI, persistence, catalog matching, and
-supplemental WMI data.
+`hardware/id.rs` parses PCI (`VEN`, `DEV`, `SUBSYS`, `REV`, `CC`), USB (`VID`,
+`PID`, `REV`, `MI`, class triplet), ACPI (`VEN`/`DEV` and compact EISA-style
+IDs), and HD Audio (`FUNC`, `VEN`, `DEV`, `SUBSYS`, `REV`) fields. The raw string
+is always retained. `hardware/vendors.rs` maps public vendor identifiers to
+names through small curated tables; adding a vendor or identifier family only
+changes that module. `hardware/identify.rs` resolves a preferred manufacturer
+(subsystem vendor when present, otherwise the hardware vendor), keeps the
+hardware and subsystem vendors separate, preserves Windows-reported names, and
+records notes. Confidence is `confirmed` when a known device vendor matched and
+reported metadata does not conflict, `partial` for subsystem-only, incomplete, or
+conflicting identity, and `unresolved` when no known vendor identifier matched.
+Reported names never establish identity on their own.
+
+`DeviceCategory` derives processor, graphics, motherboard, chipset, network,
+audio, Bluetooth, USB, storage, input, and other groups from the Windows class,
+PCI/USB class codes, and a small set of well-known ACPI IDs. Friendly names are
+never used for classification.
+
+`DeviceCondition` combines presence, lifecycle state, problem code, and driver
+metadata into `healthy`, `disabled`, `problem`, `missing-driver`, `non-present`,
+or `unknown`. This is a presentation classification; the raw status flags and
+problem code remain on every record.
+
+The command runs the synchronous scan on `tauri::async_runtime::spawn_blocking`
+so Configuration Manager cannot block the async runtime. Scans are not persisted,
+no catalog match is attempted, and the hardware module is `Ready`. Driver
+matching and installation belong to later phases.
 
 ### Windows isolation
 
@@ -320,11 +351,14 @@ Unit tests cover configuration validation and disk round-tripping, error
 sanitization, module status reporting, input validation, and preference
 defaults, parsing, normalization, and rejection rules.
 
-Hardware tests cover PCI/USB identifier parsing, malformed-ID preservation,
-instance-ID validation, device status and `CM_PROB_*` mapping, category
-classification, snapshot helpers, provider injection, multi-string decoding,
-GUID formatting, FILETIME conversion, and a real-hardware enumeration of the
-local present device tree.
+Hardware tests cover PCI/USB/ACPI/HDAUDIO identifier parsing, malformed-ID
+preservation, instance-ID validation, device status and `CM_PROB_*` mapping,
+condition classification, category classification, vendor lookup and aliases,
+identity resolution and confidence, conflicting manufacturer metadata,
+incomplete and unknown identifiers, snapshot helpers, provider injection,
+multi-string decoding, GUID formatting, FILETIME conversion, case-insensitive
+instance-ID deduplication, command error sanitization, and a real-hardware
+enumeration of the local device tree.
 
 Database tests cover initial creation, reopening with persisted preferences,
 migration output, corrupt-file recovery, catalog read-only access, missing
@@ -341,7 +375,7 @@ directly without a webview.
 
 ## Deliberate omissions
 
-- No hardware scan command, persisted scan, or frontend hardware data.
+- No persisted scan, scan history write, or catalog matching.
 - No WMI queries, SetupAPI driver-package inspection, or driver installation.
 - No driver matching, manufacturer integrations, or source scraping.
 - No network requests, downloads, or installers.

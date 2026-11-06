@@ -13,6 +13,7 @@ export interface DropdownProps {
   onChange: (value: string) => void;
   options: readonly DropdownOption[];
   label?: string;
+  ariaLabel?: string;
   hint?: string;
   disabled?: boolean;
   id?: string;
@@ -24,6 +25,7 @@ export function Dropdown({
   onChange,
   options,
   label,
+  ariaLabel,
   hint,
   disabled = false,
   id,
@@ -46,6 +48,7 @@ export function Dropdown({
           value={value}
           onChange={(event) => onChange(event.target.value)}
           disabled={disabled}
+          aria-label={label ? undefined : ariaLabel}
           aria-describedby={hintId}
           className="h-9 w-full appearance-none rounded-md border border-white/10 bg-surface-950/60 pl-3 pr-9 text-sm text-slate-100 transition-colors focus:border-accent-500/60 focus:outline-none focus:ring-2 focus:ring-accent-500/20 disabled:cursor-not-allowed disabled:opacity-60"
         >

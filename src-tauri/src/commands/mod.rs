@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod database;
+pub mod hardware;
 pub mod preferences;
 pub mod system;
 
@@ -22,6 +23,7 @@ macro_rules! generate_command_handlers {
         tauri::generate_handler![
             $crate::commands::app::get_app_info,
             $crate::commands::database::get_database_health,
+            $crate::commands::hardware::scan_hardware,
             $crate::commands::preferences::get_preferences,
             $crate::commands::preferences::reset_preferences,
             $crate::commands::preferences::update_preferences,

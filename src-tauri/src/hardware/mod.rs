@@ -5,26 +5,29 @@
 //! directly: the Windows provider lives under
 //! [`crate::platform::windows`] and is injected by [`crate::state::AppState`].
 //!
-//! Phase 6 prepares native enumeration but does not expose a scan command or
-//! frontend hardware data. The complete scanner belongs to Phase 7.
+//! Enumeration is exposed through the `scan_hardware` command, but driver
+//! matching and catalog lookup remain separate domains.
 
 pub mod category;
 pub mod id;
+pub mod identify;
 pub mod model;
 pub mod provider;
 pub mod status;
+pub mod vendors;
 
 use std::sync::Arc;
 
-use crate::state::ModuleStatus;
+use crate::state::{ModuleState, ModuleStatus};
 
 use self::{
+    identify::IdentificationConfidence,
     model::HardwareSnapshot,
     provider::{DeviceEnumerator, HardwareError},
 };
 
 /// Hardware domain service.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct HardwareService {
     enumerator: Arc<dyn DeviceEnumerator>,
 }
@@ -35,19 +38,61 @@ impl HardwareService {
         Self { enumerator }
     }
 
-    /// Enumerates the current device tree.
+    /// Enumerates the current device tree, including non-present devices.
     ///
-    /// This is intentionally not registered as an IPC command yet. Phase 7
-    /// will add the user-facing scan flow, persistence, and catalog matching.
+    /// Enumeration is synchronous and may block on the operating system, so
+    /// callers on an async runtime should run it on a blocking worker.
     pub fn scan(&self) -> Result<HardwareSnapshot, HardwareError> {
-        self.enumerator.enumerate()
+        match self.enumerator.enumerate() {
+            Ok(snapshot) => {
+                let present = snapshot
+                    .devices
+                    .iter()
+                    .filter(|device| device.is_present)
+                    .count();
+                let mut confirmed = 0;
+                let mut partial = 0;
+                let mut unresolved = 0;
+                for device in &snapshot.devices {
+                    match device.identification.confidence {
+                        IdentificationConfidence::Confirmed => confirmed += 1,
+                        IdentificationConfidence::Partial => partial += 1,
+                        IdentificationConfidence::Unresolved => unresolved += 1,
+                    }
+                }
+                tracing::info!(
+                    target: "opendrvr::hardware",
+                    devices = snapshot.devices.len(),
+                    present,
+                    non_present = snapshot.devices.len().saturating_sub(present),
+                    identified = confirmed,
+                    partial,
+                    unresolved,
+                    property_failures = snapshot.diagnostics.property_failures.len(),
+                    device_failures = snapshot.diagnostics.device_failures.len(),
+                    duration_ms = snapshot.diagnostics.duration_ms,
+                    "hardware scan completed"
+                );
+                Ok(snapshot)
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "opendrvr::hardware",
+                    error = %error,
+                    "hardware scan failed"
+                );
+                Err(error)
+            }
+        }
     }
 
     pub fn status(&self) -> ModuleStatus {
-        ModuleStatus::planned(
-            "hardware",
-            "Device enumeration layer is prepared; the hardware scan is scheduled for Phase 7.",
-        )
+        ModuleStatus {
+            name: "hardware",
+            state: ModuleState::Ready,
+            detail: "Windows device enumeration with identifier-based identification is available."
+                .to_string(),
+        }
     }
 }
 
@@ -93,11 +138,11 @@ mod tests {
     }
 
     #[test]
-    fn hardware_module_remains_planned_in_phase_six() {
+    fn hardware_module_is_ready() {
         let service = HardwareService::new(Arc::new(UnsupportedDeviceEnumerator));
         let status = service.status();
 
         assert_eq!(status.name, "hardware");
-        assert_eq!(status.state, crate::state::ModuleState::Planned);
+        assert_eq!(status.state, crate::state::ModuleState::Ready);
     }
 }

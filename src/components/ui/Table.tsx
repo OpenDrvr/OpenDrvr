@@ -34,8 +34,43 @@ export function TableBody({ children }: { children: ReactNode }) {
   return <tbody className="divide-y divide-white/[0.05]">{children}</tbody>;
 }
 
-export function TableRow({ children, className }: { children: ReactNode; className?: string }) {
-  return <tr className={cn("transition-colors hover:bg-white/[0.02]", className)}>{children}</tr>;
+export function TableRow({
+  children,
+  className,
+  selected = false,
+  onClick,
+}: {
+  children: ReactNode;
+  className?: string;
+  selected?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <tr
+      className={cn(
+        "transition-colors hover:bg-white/[0.02]",
+        onClick &&
+          "cursor-pointer focus-visible:bg-white/[0.04] focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent-400",
+        selected && "bg-accent-500/[0.08] hover:bg-accent-500/[0.1]",
+        className,
+      )}
+      onClick={onClick}
+      onKeyDown={
+        onClick
+          ? (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onClick();
+              }
+            }
+          : undefined
+      }
+      tabIndex={onClick ? 0 : undefined}
+      aria-selected={onClick ? selected : undefined}
+    >
+      {children}
+    </tr>
+  );
 }
 
 export function TableHeaderCell({

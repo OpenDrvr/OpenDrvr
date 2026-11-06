@@ -3,12 +3,15 @@
 **Open Driver** — an open-source Windows utility for identifying computer hardware, discovering
 compatible drivers, and providing downloads from official manufacturer sources.
 
-> Status: **Phase 6 — native hardware integration.** The Rust backend now has a portable hardware
-> model and a Windows Plug and Play enumerator built on CfgMgr32. Device instance IDs, hardware and
-> compatible IDs, driver facts, problem codes, and device categories are read from the live device
-> tree and covered by tests. The scan is not yet exposed as an IPC command, and the Hardware page
-> still shows a planned empty state. Driver lookup, downloads, and installations remain intentionally
-> unimplemented. See [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) and
+> Status: **Phase 10 — Hardware identification and classification.** The Rust backend enumerates the
+> live Plug and Play device tree with CfgMgr32, including present and non-present devices. It parses
+> PCI, USB, ACPI, and HD Audio identifiers; resolves known vendor and subsystem vendors from a
+> curated, maintainable table; and classifies devices into useful categories. Reported manufacturer,
+> hardware vendor, subsystem vendor, and driver provider remain distinct. The Hardware page shows
+> identity confidence (confirmed, partial, or unresolved), parsed identifier details, categories,
+> driver metadata, and raw identifiers for future matching. Driver catalog matching, downloads, and
+> installations remain intentionally unimplemented. See
+> [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) and
 > [`src-tauri/HARDWARE_INTEGRATION.md`](src-tauri/HARDWARE_INTEGRATION.md) for the design.
 
 ## Stack
@@ -92,6 +95,7 @@ Release artifacts are written under
 │       ├── navigation.ts     Page definitions and hash parsing
 │       ├── useAppNavigation.ts  Hash-based desktop navigation
 │       ├── useBackendSnapshot.ts  App, module, and database status loading
+│       ├── useHardwareScan.ts Real hardware scan with latest-request-wins refresh
 │       ├── usePreferences.ts Persisted preference loading, saving and reset
 │       ├── toast.ts          Toast context contract
 │       └── cn.ts             Conditional class names
@@ -99,7 +103,7 @@ Release artifacts are written under
 │   ├── src/lib.rs            Tauri builder, startup, and state registration
 │   ├── src/main.rs           Windows desktop entry point
 │   ├── src/commands/         Thin IPC adapters and command registration
-│   ├── src/hardware/         Portable device model, IDs, status, categories, provider trait
+│   ├── src/hardware/         Portable model, IDs, identification, vendors, status, categories
 │   ├── src/drivers/          Driver discovery boundary
 │   ├── src/sources/          Official source registry boundary
 │   ├── src/database/         Embedded SQLite: user database and bundled catalog
@@ -116,7 +120,7 @@ Release artifacts are written under
 │   ├── resources/catalog/    Catalog schema and read-only SQLite snapshot
 │   ├── examples/             Maintenance tools (catalog regeneration)
 │   ├── ARCHITECTURE.md       Backend design and decisions
-│   ├── HARDWARE_INTEGRATION.md  Windows API assessment and Phase 7 plan
+│   ├── HARDWARE_INTEGRATION.md  Windows API assessment and hardware design
 │   ├── capabilities/         Tauri 2 window capabilities
 │   ├── icons/                Windows icon assets
 │   ├── build.rs              Tauri build script
@@ -173,6 +177,7 @@ macro_rules! generate_command_handlers {
         tauri::generate_handler![
             $crate::commands::app::get_app_info,
             $crate::commands::database::get_database_health,
+            $crate::commands::hardware::scan_hardware,
             $crate::commands::preferences::get_preferences,
             $crate::commands::preferences::reset_preferences,
             $crate::commands::preferences::update_preferences,
@@ -227,9 +232,11 @@ browser-style back/forward works without a router dependency. The current page i
 The initial pages are deliberately honest:
 
 - **Overview** introduces OpenDrvr, its principles, and the real backend module states.
-- **Hardware** still shows a planned empty state even though the native enumeration layer is ready;
-  the scan command and UI land in Phase 7. **Drivers** and **Downloads** remain planned. No hardware,
-  driver status, or transfer data is invented.
+- **Hardware** reads the real Windows device tree through `scan_hardware`. It shows summary counts,
+  searchable and filterable devices, identification coverage, scan errors, empty and loading states,
+  a refresh action, and a detail panel with parsed identifiers, identified vendors, driver metadata,
+  status, and location. **Drivers** and **Downloads** remain planned. No hardware, driver status, or
+  transfer data is invented.
 - **Settings** reads and writes real preferences through Rust: theme, update channel, download folder,
   and three download/update switches. Changes are tracked as a draft with explicit **Save changes**,
   **Discard**, and **Restore defaults** actions, inline validation, loading skeletons, error states,
@@ -241,26 +248,40 @@ About dialog.
 
 ## Hardware integration
 
-Phase 6 adds the native layer that the future hardware scanner will use. It is
-not yet connected to the UI: there is no scan command, no persisted scan, and no
-catalog matching. The Hardware page remains an honest planned empty state.
+Phase 10 builds identification on top of the native enumerator. The `scan_hardware` command runs the
+synchronous CfgMgr32 scan on a blocking worker and returns a serializable snapshot. The Hardware page
+loads that snapshot on mount and can rescan on demand. Scans are not persisted yet, and no catalog
+matching or driver installation happens.
 
-The primary API is **CfgMgr32** (`cfgmgr32.dll`) through `windows-rs`. It
-enumerates the present Plug and Play device tree, reads device and driver
-properties, and returns Configuration Manager status flags and problem codes.
-SetupAPI is reserved for future read-only INF and driver-package inspection;
-WMI/CIM is reserved for supplemental facts such as CPU model, GPU memory,
-motherboard model, BIOS version, and physical memory.
+The primary API is **CfgMgr32** (`cfgmgr32.dll`) through `windows-rs`. It enumerates all installed
+Plug and Play device nodes, locates present devices normally, falls back to the phantom flag for
+non-present devices, and reads device and driver properties plus Configuration Manager status flags
+and problem codes. SetupAPI is reserved for future read-only INF and driver-package inspection;
+WMI/CIM is reserved for supplemental facts such as CPU model, GPU memory, motherboard model, BIOS
+version, and physical memory.
 
 The backend reads and preserves:
 
 - the device instance ID and enumerator
 - hardware IDs and compatible IDs, in the order Windows reports them
-- best-effort PCI and USB fields, while keeping malformed IDs verbatim
+- best-effort PCI, USB, ACPI, and HD Audio fields, while keeping malformed IDs verbatim
 - device class, class GUID, manufacturer, friendly name, and description
 - parent instance ID, location information, bus number, and address
-- driver provider, version, date, description, INF path, and service name
+- driver provider, version, date, description, INF file name, and service name
 - device state, raw problem code, and a coarse problem classification
+- a user-facing condition: healthy, disabled, problem, missing driver, non-present, or unknown
+- an identification result: preferred manufacturer, hardware vendor, subsystem vendor, identifier
+  families, notes, and a confidence of confirmed, partial, or unresolved
+
+Identification uses a curated vendor table for PCI, USB, ACPI, and HD Audio IDs. Reported names and
+manufacturers are preserved but are never treated as confirmed identity on their own. Unknown or
+incomplete identifiers remain unresolved, and conflicting Windows metadata lowers the result to
+partial rather than rewriting the raw data. Categories cover processor, graphics, motherboard,
+chipset, network, audio, Bluetooth, USB, storage, input, and other devices.
+
+Device instance IDs are deduplicated case-insensitively, and results are sorted for deterministic
+output. The scanner emits a record even when optional properties are missing. Property and device
+read failures are collected in scan diagnostics and logged without aborting the rest of the scan.
 
 The `hardware` module stays portable and Tauri-free. It owns the data model and
 the `DeviceEnumerator` trait. `platform::windows::device_tree` is the only code
@@ -271,11 +292,11 @@ fake enumerator.
 Standard users can enumerate devices and read most properties. Some properties
 may be denied; the scanner records those as diagnostics and continues. Driver
 installation, driver-store changes, and some WMI classes require administrator
-rights and are not part of Phase 6. OpenDrvr does not auto-elevate.
+rights and are not part of Phase 10. OpenDrvr does not auto-elevate.
 
 See [`src-tauri/HARDWARE_INTEGRATION.md`](src-tauri/HARDWARE_INTEGRATION.md) for
 the full API assessment, data model, privileges, compatibility notes, and the
-Phase 7 plan.
+next-phase catalog-matching boundary.
 
 ## Embedded database
 

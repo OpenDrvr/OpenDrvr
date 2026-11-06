@@ -8,6 +8,7 @@
 //! failure is recorded in [`ScanDiagnostics`] and the device record is emitted
 //! with that field unset. Only failure to obtain the device ID list is fatal.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Instant;
 
@@ -15,8 +16,8 @@ use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_PropertyW, CM_Get_DevNode_Status, CM_Get_Device_ID_ListW,
     CM_Get_Device_ID_List_SizeW, CM_Locate_DevNodeW, CM_DEVNODE_STATUS_FLAGS,
-    CM_GETIDLIST_FILTER_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CR_BUFFER_SMALL,
-    CR_NO_SUCH_VALUE, CR_SUCCESS,
+    CM_GETIDLIST_FILTER_NONE, CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CM_PROB,
+    CR_BUFFER_SMALL, CR_NO_SUCH_VALUE, CR_SUCCESS,
 };
 use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_Address, DEVPKEY_Device_BusNumber, DEVPKEY_Device_Class,
@@ -34,12 +35,13 @@ use windows::Win32::Foundation::DEVPROPKEY;
 use crate::hardware::{
     category::DeviceCategory,
     id::{DeviceInstanceId, HardwareId},
+    identify::{DeviceIdentification, IdentificationInput},
     model::{
         DeviceFailure, DeviceLocation, DeviceRecord, DriverInfo, HardwareSnapshot, PropertyFailure,
         ScanDiagnostics,
     },
     provider::{DeviceEnumerator, HardwareError},
-    status::DeviceStatus,
+    status::{DeviceCondition, DeviceStatus},
 };
 
 /// CfgMgr32-backed enumerator for the local machine.
@@ -48,17 +50,17 @@ pub struct WindowsDeviceEnumerator;
 
 impl DeviceEnumerator for WindowsDeviceEnumerator {
     fn enumerate(&self) -> Result<HardwareSnapshot, HardwareError> {
-        enumerate_present_devices()
+        enumerate_devices()
     }
 }
 
-fn enumerate_present_devices() -> Result<HardwareSnapshot, HardwareError> {
+fn enumerate_devices() -> Result<HardwareSnapshot, HardwareError> {
     let started = Instant::now();
     let instance_ids = device_instance_ids()?;
 
     let mut diagnostics = ScanDiagnostics {
         provider: "CfgMgr32".to_string(),
-        present_only: true,
+        present_only: false,
         ..ScanDiagnostics::default()
     };
     let mut devices = Vec::with_capacity(instance_ids.len());
@@ -78,7 +80,11 @@ fn enumerate_present_devices() -> Result<HardwareSnapshot, HardwareError> {
         }
     }
 
+    // The provider list is already deduplicated, but sorting and deduplicating
+    // again keeps the snapshot deterministic even if a future provider repeats
+    // an instance ID.
     devices.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+    devices.dedup_by(|left, right| left.instance_id == right.instance_id);
     diagnostics.device_count = devices.len();
     diagnostics.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -95,7 +101,7 @@ fn device_instance_ids() -> Result<Vec<String>, HardwareError> {
     for _ in 0..3 {
         let mut size = 0u32;
         let result =
-            unsafe { CM_Get_Device_ID_List_SizeW(&mut size, filter, CM_GETIDLIST_FILTER_PRESENT) };
+            unsafe { CM_Get_Device_ID_List_SizeW(&mut size, filter, CM_GETIDLIST_FILTER_NONE) };
 
         if result != CR_SUCCESS {
             return Err(HardwareError::ConfigManager {
@@ -109,10 +115,10 @@ fn device_instance_ids() -> Result<Vec<String>, HardwareError> {
 
         let mut buffer = vec![0u16; size as usize];
         let result =
-            unsafe { CM_Get_Device_ID_ListW(filter, &mut buffer, CM_GETIDLIST_FILTER_PRESENT) };
+            unsafe { CM_Get_Device_ID_ListW(filter, &mut buffer, CM_GETIDLIST_FILTER_NONE) };
 
         if result == CR_SUCCESS {
-            return Ok(parse_device_id_list(&buffer));
+            return Ok(deduplicate_instance_ids(parse_device_id_list(&buffer)));
         }
         if result != CR_BUFFER_SMALL {
             return Err(HardwareError::ConfigManager {
@@ -128,6 +134,17 @@ fn device_instance_ids() -> Result<Vec<String>, HardwareError> {
         operation: "CM_Get_Device_ID_ListW",
         code: last_code,
     })
+}
+
+/// Removes duplicate instance IDs while preserving the order Windows reported.
+///
+/// Device instance IDs are case-insensitive, so the comparison folds ASCII case.
+fn deduplicate_instance_ids(identifiers: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    identifiers
+        .into_iter()
+        .filter(|identifier| seen.insert(identifier.to_ascii_lowercase()))
+        .collect()
 }
 
 fn parse_device_id_list(buffer: &[u16]) -> Vec<String> {
@@ -159,39 +176,67 @@ fn enumerate_device(
     instance_id: &DeviceInstanceId,
     diagnostics: &mut ScanDiagnostics,
 ) -> Option<DeviceRecord> {
-    let devinst = match locate_devnode(instance_id) {
-        Ok(devinst) => devinst,
+    let (devinst, located_as_phantom) = match locate_devnode(instance_id) {
+        Ok(located) => located,
         Err(code) => {
             diagnostics.device_failures.push(DeviceFailure {
                 instance_id: instance_id.as_str().to_string(),
                 operation: "CM_Locate_DevNodeW".to_string(),
                 error: format!("Configuration Manager error {code}"),
             });
+            tracing::debug!(
+                target: "opendrvr::hardware",
+                instance_id = instance_id.as_str(),
+                code,
+                "failed to locate device node"
+            );
             return None;
         }
     };
 
+    // Presence is read first so property failures for devices that are no longer
+    // connected are treated as expected instead of being reported as warnings.
+    let is_present = property_optional(
+        diagnostics,
+        instance_id,
+        true,
+        "DEVPKEY_Device_IsPresent",
+        read_bool(devinst, &DEVPKEY_Device_IsPresent),
+    )
+    .unwrap_or(!located_as_phantom);
+
     let status = match devnode_status(devinst) {
         Ok(status) => status,
         Err(code) => {
-            diagnostics.device_failures.push(DeviceFailure {
-                instance_id: instance_id.as_str().to_string(),
-                operation: "CM_Get_DevNode_Status".to_string(),
-                error: format!("Configuration Manager error {code}"),
-            });
+            if is_present {
+                diagnostics.device_failures.push(DeviceFailure {
+                    instance_id: instance_id.as_str().to_string(),
+                    operation: "CM_Get_DevNode_Status".to_string(),
+                    error: format!("Configuration Manager error {code}"),
+                });
+                tracing::debug!(
+                    target: "opendrvr::hardware",
+                    instance_id = instance_id.as_str(),
+                    code,
+                    "failed to read device status"
+                );
+            }
             DeviceStatus::unknown()
         }
     };
 
+    let record_failures = is_present;
     let class_name = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_Class",
         read_string(devinst, &DEVPKEY_Device_Class),
     );
     let class_guid = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_ClassGuid",
         read_guid(devinst, &DEVPKEY_Device_ClassGuid),
     )
@@ -199,24 +244,28 @@ fn enumerate_device(
     let manufacturer = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_Manufacturer",
         read_string(devinst, &DEVPKEY_Device_Manufacturer),
     );
     let friendly_name = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_FriendlyName",
         read_string(devinst, &DEVPKEY_Device_FriendlyName),
     );
     let device_description = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_DeviceDesc",
         read_string(devinst, &DEVPKEY_Device_DeviceDesc),
     );
     let enumerator = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_EnumeratorName",
         read_string(devinst, &DEVPKEY_Device_EnumeratorName),
     )
@@ -224,6 +273,7 @@ fn enumerate_device(
     let parent_instance_id = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_Parent",
         read_string(devinst, &DEVPKEY_Device_Parent),
     )
@@ -232,6 +282,7 @@ fn enumerate_device(
     let hardware_ids = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_HardwareIds",
         read_string_list(devinst, &DEVPKEY_Device_HardwareIds),
     )
@@ -242,6 +293,7 @@ fn enumerate_device(
     let compatible_ids = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_CompatibleIds",
         read_string_list(devinst, &DEVPKEY_Device_CompatibleIds),
     )
@@ -253,12 +305,14 @@ fn enumerate_device(
     let location_info = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_LocationInfo",
         read_string(devinst, &DEVPKEY_Device_LocationInfo),
     );
     let location_paths = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_LocationPaths",
         read_string_list(devinst, &DEVPKEY_Device_LocationPaths),
     )
@@ -266,38 +320,36 @@ fn enumerate_device(
     let bus_number = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_BusNumber",
         read_u32(devinst, &DEVPKEY_Device_BusNumber),
     );
     let address = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_Address",
         read_u32(devinst, &DEVPKEY_Device_Address),
     );
-    let is_present = property_optional(
-        diagnostics,
-        instance_id,
-        "DEVPKEY_Device_IsPresent",
-        read_bool(devinst, &DEVPKEY_Device_IsPresent),
-    )
-    .unwrap_or(true);
 
     let driver_provider = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_DriverProvider",
         read_string(devinst, &DEVPKEY_Device_DriverProvider),
     );
     let driver_version = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_DriverVersion",
         read_string(devinst, &DEVPKEY_Device_DriverVersion),
     );
     let driver_date = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_DriverDate",
         read_filetime(devinst, &DEVPKEY_Device_DriverDate),
     )
@@ -305,18 +357,21 @@ fn enumerate_device(
     let driver_description = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_DriverDesc",
         read_string(devinst, &DEVPKEY_Device_DriverDesc),
     );
-    let driver_inf_path = property_optional(
+    let driver_inf_name = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_DriverInfPath",
         read_string(devinst, &DEVPKEY_Device_DriverInfPath),
     );
     let driver_service = property_optional(
         diagnostics,
         instance_id,
+        record_failures,
         "DEVPKEY_Device_Service",
         read_string(devinst, &DEVPKEY_Device_Service),
     );
@@ -325,14 +380,14 @@ fn enumerate_device(
         || driver_version.is_some()
         || driver_date.is_some()
         || driver_description.is_some()
-        || driver_inf_path.is_some()
+        || driver_inf_name.is_some()
         || driver_service.is_some();
     let driver = has_driver_metadata.then_some(DriverInfo {
         provider: driver_provider,
         version: driver_version,
         date: driver_date,
         description: driver_description,
-        inf_path: driver_inf_path,
+        inf_name: driver_inf_name,
         service: driver_service,
     });
 
@@ -343,6 +398,14 @@ fn enumerate_device(
         &hardware_ids,
         &compatible_ids,
     );
+    let identification = DeviceIdentification::resolve(IdentificationInput {
+        instance_id,
+        hardware_ids: &hardware_ids,
+        compatible_ids: &compatible_ids,
+        reported_manufacturer: manufacturer.as_deref(),
+        reported_name: friendly_name.as_deref().or(device_description.as_deref()),
+    });
+    let condition = DeviceCondition::classify(is_present, &status, driver.is_some());
 
     Some(DeviceRecord {
         instance_id: instance_id.clone(),
@@ -350,6 +413,7 @@ fn enumerate_device(
         compatible_ids,
         bus_type,
         category,
+        identification,
         class_name,
         class_guid,
         manufacturer,
@@ -366,13 +430,18 @@ fn enumerate_device(
         driver,
         status,
         is_present,
+        condition,
     })
 }
 
-fn locate_devnode(instance_id: &DeviceInstanceId) -> Result<u32, u32> {
+/// Locates a device node, falling back to the phantom flag for devices that are
+/// installed but not currently connected.
+///
+/// Returns the node handle and whether the phantom lookup was required.
+fn locate_devnode(instance_id: &DeviceInstanceId) -> Result<(u32, bool), u32> {
     let wide = wide_string(instance_id.as_str());
     let mut devinst = 0u32;
-    let result = unsafe {
+    let normal = unsafe {
         CM_Locate_DevNodeW(
             &mut devinst,
             PCWSTR::from_raw(wide.as_ptr()),
@@ -380,10 +449,23 @@ fn locate_devnode(instance_id: &DeviceInstanceId) -> Result<u32, u32> {
         )
     };
 
-    if result == CR_SUCCESS {
-        Ok(devinst)
+    if normal == CR_SUCCESS {
+        return Ok((devinst, false));
+    }
+
+    let mut phantom_devinst = 0u32;
+    let phantom = unsafe {
+        CM_Locate_DevNodeW(
+            &mut phantom_devinst,
+            PCWSTR::from_raw(wide.as_ptr()),
+            CM_LOCATE_DEVNODE_PHANTOM,
+        )
+    };
+
+    if phantom == CR_SUCCESS {
+        Ok((phantom_devinst, true))
     } else {
-        Err(result.0)
+        Err(normal.0)
     }
 }
 
@@ -402,17 +484,27 @@ fn devnode_status(devinst: u32) -> Result<DeviceStatus, u32> {
 fn property_optional<T>(
     diagnostics: &mut ScanDiagnostics,
     instance_id: &DeviceInstanceId,
+    record_failure: bool,
     property: &'static str,
     result: Result<Option<T>, PropertyError>,
 ) -> Option<T> {
     match result {
         Ok(value) => value,
         Err(error) => {
-            diagnostics.property_failures.push(PropertyFailure {
-                instance_id: instance_id.clone(),
-                property: property.to_string(),
-                error: error.to_string(),
-            });
+            if record_failure {
+                tracing::debug!(
+                    target: "opendrvr::hardware",
+                    instance_id = instance_id.as_str(),
+                    property,
+                    error = %error,
+                    "device property unavailable"
+                );
+                diagnostics.property_failures.push(PropertyFailure {
+                    instance_id: instance_id.clone(),
+                    property: property.to_string(),
+                    error: error.to_string(),
+                });
+            }
             None
         }
     }
@@ -727,19 +819,48 @@ mod tests {
     }
 
     #[test]
-    fn enumerates_present_devices_from_the_local_machine() {
+    fn deduplicates_instance_ids_case_insensitively() {
+        let identifiers = vec![
+            r"PCI\VEN_8086&DEV_1234\0".to_string(),
+            r"pci\ven_8086&dev_1234\0".to_string(),
+            r"USB\VID_046D&PID_C52B\1".to_string(),
+        ];
+
+        assert_eq!(
+            deduplicate_instance_ids(identifiers),
+            vec![
+                r"PCI\VEN_8086&DEV_1234\0".to_string(),
+                r"USB\VID_046D&PID_C52B\1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn enumerates_devices_from_the_local_machine() {
         let snapshot = WindowsDeviceEnumerator
             .enumerate()
-            .expect("enumerate present devices");
+            .expect("enumerate devices");
 
-        assert!(snapshot.diagnostics.present_only);
+        assert!(!snapshot.diagnostics.present_only);
         assert_eq!(snapshot.diagnostics.provider, "CfgMgr32");
         assert_eq!(snapshot.diagnostics.device_count, snapshot.devices.len());
         assert!(!snapshot.devices.is_empty());
-        assert!(snapshot.devices.iter().all(|device| device.is_present));
         assert!(snapshot
             .devices
             .iter()
             .any(|device| !device.hardware_ids.is_empty()));
+
+        let mut instance_ids = HashSet::new();
+        for device in &snapshot.devices {
+            assert!(
+                instance_ids.insert(device.instance_id.as_str().to_ascii_lowercase()),
+                "duplicate device instance ID: {}",
+                device.instance_id
+            );
+            assert_eq!(
+                device.condition == DeviceCondition::NonPresent,
+                !device.is_present
+            );
+        }
     }
 }
