@@ -1,3 +1,4 @@
+pub mod catalog;
 mod commands;
 mod config;
 mod database;
@@ -49,10 +50,12 @@ pub fn run() {
 
             let data_dir = platform::data_dir(app.handle());
             let catalog_path = platform::catalog_path(app.handle());
+            let catalog_updates_dir = platform::catalog_updates_dir(app.handle());
             let database = tauri::async_runtime::block_on(database::Database::initialize(
                 &config.database,
                 data_dir.as_deref(),
                 catalog_path.as_deref(),
+                catalog_updates_dir.as_deref(),
             ));
 
             app.manage(state::AppState::new(config, database));

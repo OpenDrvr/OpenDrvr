@@ -1,7 +1,9 @@
-//! Regenerates the bundled catalog snapshot from `resources/catalog/schema.sql`.
+//! Regenerates the bundled catalog snapshot from the embedded v2 schema.
 //!
-//! This is a maintenance tool, not part of the application runtime. The catalog
-//! contains schema metadata only until real hardware and driver data exists.
+//! This is a maintenance tool, not part of the application runtime. The
+//! generated snapshot contains schema metadata only until verified hardware and
+//! driver records exist. Real records must be imported with
+//! `examples/import_catalog.rs` so validation and provenance rules apply.
 //!
 //! Run from `src-tauri`:
 //!
@@ -9,31 +11,24 @@
 //! cargo run --example build_catalog
 //! ```
 
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
-use sqlx::sqlite::SqliteConnectOptions;
+use opendrvr_lib::catalog::import::build_empty_snapshot;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tauri::async_runtime::block_on(async {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let schema_path = root.join("resources/catalog/schema.sql");
         let catalog_path = root.join("resources/catalog/catalog.sqlite3");
 
-        let schema = fs::read_to_string(&schema_path)?;
+        let summary = build_empty_snapshot(&catalog_path, true).await?;
 
-        if catalog_path.exists() {
-            fs::remove_file(&catalog_path)?;
-        }
-
-        let options = SqliteConnectOptions::new()
-            .filename(&catalog_path)
-            .create_if_missing(true);
-        let pool = sqlx::SqlitePool::connect_with(options).await?;
-
-        sqlx::raw_sql(&schema).execute(&pool).await?;
-        pool.close().await;
-
-        println!("wrote {}", catalog_path.display());
+        println!(
+            "wrote {} (schema v{}, catalog v{}, {} drivers)",
+            catalog_path.display(),
+            summary.schema_version,
+            summary.catalog_version,
+            summary.driver_count
+        );
         Ok::<(), Box<dyn std::error::Error>>(())
     })
 }

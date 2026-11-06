@@ -19,11 +19,20 @@ export interface UserDatabaseHealth {
   message: string | null;
 }
 
+export type CatalogOrigin = "bundled" | "update";
+
 export interface CatalogDatabaseHealth {
   status: DatabaseComponentStatus;
+  origin: CatalogOrigin | null;
   schemaVersion: number | null;
+  catalogVersion: string | null;
+  generatedAt: string | null;
+  lastVerifiedAt: string | null;
   tables: number;
   manufacturerCount: number;
+  hardwareDeviceCount: number;
+  driverSourceCount: number;
+  driverCount: number;
   readOnly: boolean;
   message: string | null;
 }

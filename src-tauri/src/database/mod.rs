@@ -71,10 +71,15 @@ impl Database {
     /// Initializes both components. A missing or broken catalog degrades
     /// gracefully; a broken user database is reported through health checks and
     /// does not prevent the application from starting.
+    ///
+    /// `catalog_updates_dir` is an optional per-user directory of immutable
+    /// catalog snapshots. It is separate from the writable user database and
+    /// never receives preferences, scan history, or download history.
     pub async fn initialize(
         config: &DatabaseConfig,
         data_dir: Option<&Path>,
         catalog_path: Option<&Path>,
+        catalog_updates_dir: Option<&Path>,
     ) -> Self {
         let user = match data_dir {
             Some(data_dir) => {
@@ -109,12 +114,15 @@ impl Database {
         };
 
         let catalog = match catalog_path {
-            Some(path) => match CatalogDatabase::open(path).await {
+            Some(path) => match CatalogDatabase::open_with_updates(path, catalog_updates_dir).await
+            {
                 Ok(database) => {
                     tracing::info!(
                         path = %path.display(),
                         schema_version = database.schema_version(),
-                        "bundled catalog ready"
+                        catalog_version = %database.catalog_version(),
+                        origin = ?database.origin(),
+                        "catalog snapshot ready"
                     );
                     CatalogState::Ready(database)
                 }
@@ -122,11 +130,10 @@ impl Database {
                     tracing::warn!(
                         error = %error,
                         path = %path.display(),
-                        "bundled catalog unavailable"
+                        "catalog unavailable"
                     );
                     CatalogState::Unavailable(
-                        "Bundled catalog is unavailable; catalog features are disabled."
-                            .to_string(),
+                        "Catalog is unavailable; catalog features are disabled.".to_string(),
                     )
                 }
             },
@@ -151,12 +158,14 @@ impl Database {
             UserState::Ready(user) => {
                 let detail = match &self.catalog {
                     CatalogState::Ready(catalog) => format!(
-                        "User database ready (schema v{}); bundled catalog ready (schema v{}).",
+                        "User database ready (schema v{}); catalog ready (v{}, {}, schema v{}).",
                         user.schema_version(),
+                        catalog.catalog_version(),
+                        catalog.origin().as_str(),
                         catalog.schema_version()
                     ),
                     CatalogState::Unavailable(_) => format!(
-                        "User database ready (schema v{}); bundled catalog unavailable.",
+                        "User database ready (schema v{}); catalog unavailable.",
                         user.schema_version()
                     ),
                 };
@@ -276,7 +285,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::database::models::DatabaseComponentStatus;
+    use crate::catalog::import::build_snapshot;
+    use crate::catalog::model::CatalogDocument;
+    use crate::catalog::schema::SOURCE_POLICY_VERSION;
+    use crate::database::models::{CatalogOrigin, DatabaseComponentStatus};
     use crate::database::test_support::TestDir;
 
     fn bundled_catalog() -> PathBuf {
@@ -293,6 +305,7 @@ mod tests {
             &DatabaseConfig::default(),
             Some(dir.path()),
             Some(&catalog_path),
+            None,
         )
         .await;
 
@@ -307,6 +320,8 @@ mod tests {
         let health = database.health().await;
         assert_eq!(health.user.status, DatabaseComponentStatus::Ok);
         assert_eq!(health.catalog.status, DatabaseComponentStatus::Ok);
+        assert_eq!(health.catalog.origin, Some(CatalogOrigin::Bundled));
+        assert_eq!(health.catalog.catalog_version.as_deref(), Some("0.0.0"));
         assert_eq!(health.catalog.manufacturer_count, 0);
         assert!(health.catalog.read_only);
         assert!(dir.path().join("opendrvr.sqlite3").is_file());
@@ -317,10 +332,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_update_does_not_touch_user_data() {
+        let dir = TestDir::new("database-update-separation");
+        let bundled = bundled_catalog();
+        let bundled_size = fs::metadata(&bundled).expect("catalog metadata").len();
+        let updates = dir.path().join("catalog-updates");
+        fs::create_dir_all(&updates).expect("create updates directory");
+
+        let database = Database::initialize(
+            &DatabaseConfig::default(),
+            Some(dir.path()),
+            Some(&bundled),
+            Some(&updates),
+        )
+        .await;
+
+        let preferences = AppPreferences {
+            notify_downloads: false,
+            ..AppPreferences::default()
+        };
+        database
+            .update_preferences(&preferences)
+            .await
+            .expect("save preferences");
+        drop(database);
+
+        let document = CatalogDocument {
+            catalog_version: "2026.11.6".to_string(),
+            generated_at: "2026-11-06T00:00:00Z".to_string(),
+            source_policy_version: SOURCE_POLICY_VERSION.to_string(),
+            last_verified_at: None,
+            manufacturers: Vec::new(),
+            hardware_devices: Vec::new(),
+            driver_sources: Vec::new(),
+            drivers: Vec::new(),
+        };
+        build_snapshot(&updates.join("catalog-2026.11.6.sqlite3"), &document, false)
+            .await
+            .expect("build update snapshot");
+
+        let reopened = Database::initialize(
+            &DatabaseConfig::default(),
+            Some(dir.path()),
+            Some(&bundled),
+            Some(&updates),
+        )
+        .await;
+
+        let health = reopened.health().await;
+        assert_eq!(health.catalog.origin, Some(CatalogOrigin::Update));
+        assert_eq!(health.catalog.catalog_version.as_deref(), Some("2026.11.6"));
+        assert_eq!(
+            reopened.get_preferences().await.expect("preferences"),
+            preferences
+        );
+        assert_eq!(
+            fs::metadata(&bundled).expect("catalog metadata").len(),
+            bundled_size
+        );
+    }
+
+    #[tokio::test]
     async fn missing_catalog_does_not_block_user_database() {
         let dir = TestDir::new("database-no-catalog");
         let database =
-            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None).await;
+            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None, None).await;
 
         let health = database.health().await;
         assert_eq!(health.user.status, DatabaseComponentStatus::Ok);
@@ -333,7 +409,7 @@ mod tests {
     async fn preferences_persist_across_reopen_and_reset() {
         let dir = TestDir::new("database-preferences");
         let database =
-            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None).await;
+            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None, None).await;
 
         assert_eq!(
             database.get_preferences().await.expect("defaults"),
@@ -356,7 +432,7 @@ mod tests {
         drop(database);
 
         let reopened =
-            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None).await;
+            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None, None).await;
         assert_eq!(
             reopened.get_preferences().await.expect("reload"),
             preferences
@@ -376,7 +452,7 @@ mod tests {
     async fn invalid_preferences_are_rejected_before_writing() {
         let dir = TestDir::new("database-invalid-preferences");
         let database =
-            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None).await;
+            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None, None).await;
 
         let preferences = AppPreferences {
             download_directory: "  ".to_string(),
@@ -395,8 +471,13 @@ mod tests {
         let not_a_directory = dir.path().join("not-a-directory");
         fs::write(&not_a_directory, b"file").expect("create file");
 
-        let database =
-            Database::initialize(&DatabaseConfig::default(), Some(&not_a_directory), None).await;
+        let database = Database::initialize(
+            &DatabaseConfig::default(),
+            Some(&not_a_directory),
+            None,
+            None,
+        )
+        .await;
 
         let health = database.health().await;
         assert_eq!(health.user.status, DatabaseComponentStatus::Unavailable);

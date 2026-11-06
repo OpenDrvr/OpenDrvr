@@ -1,13 +1,16 @@
 # OpenDrvr backend architecture
 
-This document describes the Rust backend as of **Phase 10**. The structure is
+This document describes the Rust backend as of **Phase 11**. The structure is
 intentionally conservative: it reserves clear module boundaries without adding
 abstractions that the application does not need yet. Phase 10 builds identifier
 parsing, vendor resolution, and device classification on top of the Windows Plug
-and Play enumerator exposed through `scan_hardware`. Driver catalog matching,
-manufacturer integrations, downloads, and installations remain **not**
-implemented. See [`HARDWARE_INTEGRATION.md`](HARDWARE_INTEGRATION.md) for the API
-assessment and the catalog-matching boundary.
+and Play enumerator exposed through `scan_hardware`. Phase 11 adds a versioned,
+read-only driver catalog pipeline with strict import validation and provenance;
+it still contains metadata only. Driver matching, manufacturer integrations,
+downloads, and installations remain **not** implemented. See
+[`HARDWARE_INTEGRATION.md`](HARDWARE_INTEGRATION.md) for the API assessment and
+the catalog-matching boundary, and [`CATALOG.md`](CATALOG.md) for the catalog
+schema, source policy, and import/update workflow.
 
 ## Layout
 
@@ -36,12 +39,21 @@ src-tauri/src/
 │   ├── category.rs      Conservative device categorization
 │   ├── model.rs         Portable device, driver, location, snapshot models
 │   └── provider.rs      DeviceEnumerator trait and typed errors
+├── catalog/
+│   ├── mod.rs           Catalog domain exports
+│   ├── schema.rs        Schema version, table contract, embedded DDL
+│   ├── metadata.rs      Catalog content versions and metadata validation
+│   ├── model.rs         Import document model and enums
+│   ├── source_policy.rs Official HTTPS domain policy
+│   ├── time.rs          RFC 3339 and calendar-date validation
+│   ├── validate.rs      Cross-reference, duplicate, and provenance validation
+│   └── import.rs        Immutable snapshot builder
 ├── drivers/mod.rs       Driver matching boundary (planned)
 ├── sources/mod.rs       Official manufacturer sources boundary (planned)
 ├── database/
 │   ├── mod.rs           Database service, startup degradation, health, preferences
 │   ├── user.rs          Writable user database, migrations, recovery, preference I/O
-│   ├── catalog.rs       Read-only bundled catalog
+│   ├── catalog.rs       Read-only catalog snapshots and update resolution
 │   ├── models.rs        IPC-facing health DTOs
 │   └── test_support.rs  Temporary directories for tests
 ├── downloads/mod.rs     Download orchestration boundary (planned)
@@ -61,7 +73,9 @@ src-tauri/
 ├── migrations/0002_user_configuration.sql Structured configuration table
 ├── resources/catalog/schema.sql           Catalog schema source
 ├── resources/catalog/catalog.sqlite3      Generated read-only snapshot
-├── examples/build_catalog.rs              Catalog regeneration tool
+├── examples/build_catalog.rs              Schema-only snapshot regeneration tool
+├── examples/import_catalog.rs             Validated import and update writer
+├── CATALOG.md                              Catalog source policy and workflow
 └── HARDWARE_INTEGRATION.md                 Windows API assessment and hardware design
 ```
 
@@ -215,17 +229,24 @@ SQLite is embedded through SQLx 0.8 with the bundled SQLite build, so users
 never install or configure a database server. Two independent databases keep
 shipped data and user data from interfering:
 
-| Database | Location                                 | Mode            | Contents                                                                               |
-| -------- | ---------------------------------------- | --------------- | -------------------------------------------------------------------------------------- |
-| User     | `app_data_dir()/opendrvr.sqlite3`        | read/write, WAL | preferences, structured configuration, scan history, download history, cached metadata |
-| Catalog  | Tauri resource `catalog/catalog.sqlite3` | read-only       | hardware identifiers, manufacturers, driver metadata, official sources                 |
+| Database | Location                                                                                           | Mode            | Contents                                                                               |
+| -------- | -------------------------------------------------------------------------------------------------- | --------------- | -------------------------------------------------------------------------------------- |
+| User     | `app_data_dir()/opendrvr.sqlite3`                                                                  | read/write, WAL | preferences, structured configuration, scan history, download history, cached metadata |
+| Catalog  | Tauri resource `catalog/catalog.sqlite3`, plus optional `app_data_dir()/catalog-updates/*.sqlite3` | read-only       | hardware identifiers, manufacturers, driver metadata, official sources                 |
 
 The catalog is resolved through `platform::catalog_path`. Tauri's resource
 directory is checked first, with a `CARGO_MANIFEST_DIR` fallback in debug builds
 so `cargo run` works before resources are copied. The catalog pool sets
 `read_only(true)` and `create_if_missing(false)`; accidental writes fail at the
-SQLite layer. Future incremental catalog updates should ship a new immutable
-snapshot instead of mutating the installed file.
+SQLite layer.
+
+Catalog updates are additional immutable snapshots, not in-place edits. At
+startup the runtime scans the per-user update directory, validates every
+candidate's metadata, required tables, integrity, and foreign keys, and selects
+the highest `catalog_version` that is newer than the bundled snapshot. Invalid
+updates are logged and ignored. Removing the update file rolls the application
+back to the bundled snapshot without touching user data. See
+[`CATALOG.md`](CATALOG.md) for the full workflow.
 
 The user database lives in Tauri's per-user `app_data_dir`, which is writable
 without administrator rights and survives upgrades. It never shares a file or
@@ -269,6 +290,51 @@ preference set, and narrow results; SQL text is never accepted from the
 frontend. Queries use bound parameters (`?1`, `?2`) rather than string
 interpolation, and indexes cover the lookup and ordering paths defined in the
 initial schemas.
+
+### Driver catalog pipeline
+
+The catalog is metadata only: hardware identifiers, manufacturers, driver
+package metadata, Windows compatibility, and provenance. Driver binaries are
+never bundled or stored in SQLite.
+
+Two versions are deliberately independent:
+
+- `schema_version` is the SQLite layout version (`2` in this build). A snapshot
+  with a different schema version is rejected.
+- `catalog_version` is the content version (`MAJOR.MINOR.PATCH`). It orders
+  snapshots and decides whether an update supersedes the bundled file.
+
+The shipped snapshot is schema-only with `catalog_version = 0.0.0` and a
+deterministic `generated_at` of `1970-01-01T00:00:00Z`. It contains no fabricated
+manufacturer, hardware, or driver rows. Real records are imported only from
+verified sources.
+
+`catalog/import.rs` builds a snapshot in a temporary file, applies the embedded
+schema, inserts normalized rows in one transaction, runs `PRAGMA integrity_check`
+and `PRAGMA foreign_key_check`, verifies row counts, and atomically moves the
+finished file into place. The runtime never uses this writer.
+
+`catalog/validate.rs` rejects malformed metadata, unknown cross-references,
+duplicate identities, unsafe file names, invalid checksums, and non-official
+URLs before any output is created. Hardware IDs must be concrete PCI, USB, ACPI,
+or HDAUDIO identifiers; class-only identifiers are too broad to justify a
+per-driver compatibility claim. A missing release date is a warning because it
+must not be inferred from a version string. Every driver requires at least one
+hardware match, one Windows/architecture pair, and one official source
+reference.
+
+`catalog/source_policy.rs` accepts only HTTPS URLs on a curated set of
+manufacturer-controlled domains. Windows Update entries must stay on
+Microsoft-controlled domains. Search engines, forums, and third-party driver
+aggregators are not accepted even when they mirror an official file. The domain
+list is intentionally curated and not exhaustive; adding a domain is a policy
+decision, not a convenience.
+
+The import document is described in [`CATALOG.md`](CATALOG.md) and is consumed by
+`examples/import_catalog.rs`. `examples/build_catalog.rs` regenerates the
+schema-only bundled snapshot. Catalog health reports the selected origin
+(`bundled` or `update`), both versions, generated and last-verified timestamps,
+and record counts so the UI can show exactly what data is loaded.
 
 ### Structured logging
 

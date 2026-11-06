@@ -153,12 +153,16 @@ export function AboutDialog({
                 </div>
               </div>
               <div className="flex items-center justify-between gap-3">
-                <span className="text-xs text-slate-400">Bundled catalog</span>
+                <span className="text-xs text-slate-400">Catalog</span>
                 <div className="flex items-center gap-2">
                   <span className="font-mono text-[11px] text-slate-500">
-                    {backend.snapshot.database.catalog.schemaVersion === null
-                      ? "schema —"
-                      : `schema v${backend.snapshot.database.catalog.schemaVersion}`}
+                    {backend.snapshot.database.catalog.catalogVersion === null
+                      ? "—"
+                      : `v${backend.snapshot.database.catalog.catalogVersion} · ${
+                          backend.snapshot.database.catalog.origin === "update"
+                            ? "update"
+                            : "bundled"
+                        }`}
                   </span>
                   <StatusIndicator
                     tone={

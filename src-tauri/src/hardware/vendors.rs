@@ -225,13 +225,16 @@ const ACPI_VENDORS: &[VendorEntry] = &[
     vendor("INT", "Intel"),
     vendor("INTC", "Intel"),
     vendor("LEN", "Lenovo"),
-    vendor_with_aliases("MSFT", "Microsoft", &["Microsoft Corporation"]),
     vendor_with_aliases("NVDA", "NVIDIA", &["NVIDIA Corporation"]),
-    vendor("PNP", "Microsoft"),
     vendor("QCOM", "Qualcomm"),
     vendor("SONY", "Sony"),
     vendor("TOS", "Toshiba"),
 ];
+
+// `PNP`, `ACPI`, and `MSFT` are specification namespace prefixes used by ACPI
+// IDs such as `PNP0A08` and `MSFT0101`. They are intentionally absent from the
+// table: the prefix owner is not necessarily the device manufacturer, so
+// identification stays unresolved instead of guessing Microsoft.
 
 #[cfg(test)]
 mod tests {
@@ -244,7 +247,7 @@ mod tests {
         assert_eq!(usb("046d").map(|entry| entry.name), Some("Logitech"));
         assert_eq!(usb("8087").map(|entry| entry.name), Some("Intel"));
         assert_eq!(acpi("INT").map(|entry| entry.name), Some("Intel"));
-        assert_eq!(acpi("PNP").map(|entry| entry.name), Some("Microsoft"));
+        assert_eq!(acpi("INTC").map(|entry| entry.name), Some("Intel"));
         assert_eq!(hdaudio("10EC").map(|entry| entry.name), Some("Realtek"));
     }
 
@@ -254,6 +257,13 @@ mod tests {
         assert!(usb("FFFF").is_none());
         assert!(acpi("ZZZ").is_none());
         assert!(hdaudio("FFFF").is_none());
+    }
+
+    #[test]
+    fn does_not_treat_acpi_namespace_prefixes_as_manufacturers() {
+        assert!(acpi("PNP").is_none());
+        assert!(acpi("ACPI").is_none());
+        assert!(acpi("MSFT").is_none());
     }
 
     #[test]

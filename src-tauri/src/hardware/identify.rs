@@ -495,12 +495,12 @@ mod tests {
         assert_eq!(intel.identifier_families, vec![IdentifierFamily::Acpi]);
 
         let pnp = identify(r"ACPI\PNP0A08\0", &[r"ACPI\PNP0A08"], &[], None, None);
-        assert_eq!(
-            pnp.hardware_vendor
-                .as_ref()
-                .map(|vendor| vendor.vendor_id.as_str()),
-            Some("PNP")
-        );
+        assert_eq!(pnp.confidence, IdentificationConfidence::Unresolved);
+        assert!(pnp.hardware_vendor.is_none());
+        assert!(pnp
+            .notes
+            .iter()
+            .any(|note| note.contains("No known vendor identifier")));
     }
 
     #[test]

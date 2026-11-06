@@ -475,9 +475,7 @@ export function SettingsPage({ backend, onRefresh, onAbout }: SettingsPageProps)
                         </TableCell>
                       </TableRow>
                       <TableRow className="hover:bg-transparent">
-                        <TableCell className="px-0 text-xs text-slate-300">
-                          Bundled catalog
-                        </TableCell>
+                        <TableCell className="px-0 text-xs text-slate-300">Catalog</TableCell>
                         <TableCell className="px-0 font-mono text-xs text-slate-400">
                           {backend.snapshot.database.catalog.schemaVersion === null
                             ? "—"
@@ -511,8 +509,42 @@ export function SettingsPage({ backend, onRefresh, onAbout }: SettingsPageProps)
                       value={String(backend.snapshot.database.catalog.tables)}
                     />
                     <DetailRow
+                      label="Catalog version"
+                      value={backend.snapshot.database.catalog.catalogVersion ?? "—"}
+                    />
+                    <DetailRow
+                      label="Catalog origin"
+                      value={
+                        backend.snapshot.database.catalog.origin === null
+                          ? "—"
+                          : backend.snapshot.database.catalog.origin === "update"
+                            ? "User update"
+                            : "Bundled"
+                      }
+                    />
+                    <DetailRow
                       label="Manufacturers"
                       value={String(backend.snapshot.database.catalog.manufacturerCount)}
+                    />
+                    <DetailRow
+                      label="Hardware IDs"
+                      value={String(backend.snapshot.database.catalog.hardwareDeviceCount)}
+                    />
+                    <DetailRow
+                      label="Driver sources"
+                      value={String(backend.snapshot.database.catalog.driverSourceCount)}
+                    />
+                    <DetailRow
+                      label="Drivers"
+                      value={String(backend.snapshot.database.catalog.driverCount)}
+                    />
+                    <DetailRow
+                      label="Catalog generated"
+                      value={backend.snapshot.database.catalog.generatedAt ?? "—"}
+                    />
+                    <DetailRow
+                      label="Last verified"
+                      value={backend.snapshot.database.catalog.lastVerifiedAt ?? "—"}
                     />
                   </dl>
                 </div>

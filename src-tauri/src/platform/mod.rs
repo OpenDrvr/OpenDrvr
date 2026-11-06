@@ -17,6 +17,9 @@ mod windows;
 /// File name of the bundled catalog snapshot inside the resource directory.
 pub const CATALOG_FILE_NAME: &str = "catalog.sqlite3";
 
+/// Per-user directory holding optional immutable catalog update snapshots.
+pub const CATALOG_UPDATES_DIR_NAME: &str = "catalog-updates";
+
 /// Returns the platform device enumerator injected into the hardware domain.
 ///
 /// Win32 access stays inside `platform::windows`; the hardware domain only sees
@@ -65,6 +68,19 @@ pub fn data_dir(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_data_dir().ok()
 }
 
+/// Per-user directory for optional immutable catalog update snapshots.
+///
+/// The directory is a sibling of the writable user database, not a place to
+/// store preferences or history. A missing directory means "use the bundled
+/// catalog". Runtime code only reads validated `.sqlite3` snapshots from here.
+pub fn catalog_updates_dir(app: &AppHandle) -> Option<PathBuf> {
+    resolve_catalog_updates_dir(data_dir(app).as_deref())
+}
+
+fn resolve_catalog_updates_dir(data_dir: Option<&Path>) -> Option<PathBuf> {
+    data_dir.map(|data_dir| data_dir.join(CATALOG_UPDATES_DIR_NAME))
+}
+
 /// Resolves the bundled catalog resource.
 ///
 /// Tauri installs mapped resources under the resource directory. During
@@ -103,6 +119,16 @@ fn resolve_catalog_path(resource_dir: Option<&Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_catalog_updates_directory() {
+        let data_dir = Path::new("C:\\Users\\example\\AppData\\Roaming\\com.opendrvr.desktop");
+        assert_eq!(
+            resolve_catalog_updates_dir(Some(data_dir)),
+            Some(data_dir.join(CATALOG_UPDATES_DIR_NAME))
+        );
+        assert_eq!(resolve_catalog_updates_dir(None), None);
+    }
 
     #[test]
     fn resolves_tauri_resource_layout() {

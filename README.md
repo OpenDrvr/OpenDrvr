@@ -3,15 +3,16 @@
 **Open Driver** — an open-source Windows utility for identifying computer hardware, discovering
 compatible drivers, and providing downloads from official manufacturer sources.
 
-> Status: **Phase 10 — Hardware identification and classification.** The Rust backend enumerates the
-> live Plug and Play device tree with CfgMgr32, including present and non-present devices. It parses
-> PCI, USB, ACPI, and HD Audio identifiers; resolves known vendor and subsystem vendors from a
-> curated, maintainable table; and classifies devices into useful categories. Reported manufacturer,
-> hardware vendor, subsystem vendor, and driver provider remain distinct. The Hardware page shows
-> identity confidence (confirmed, partial, or unresolved), parsed identifier details, categories,
-> driver metadata, and raw identifiers for future matching. Driver catalog matching, downloads, and
+> Status: **Phase 11 — Versioned driver catalog pipeline.** The Rust backend enumerates the live Plug
+> and Play device tree with CfgMgr32, including present and non-present devices. It parses PCI, USB,
+> ACPI, and HD Audio identifiers; resolves known vendor and subsystem vendors from a curated,
+> maintainable table; and classifies devices into useful categories. Phase 11 adds a schema-versioned,
+> read-only driver catalog with content versioning, official-source policy, provenance, strict import
+> validation, and immutable update snapshots. The bundled catalog remains schema-only until verified
+> real data is available; no records are fabricated. Driver catalog matching, downloads, and
 > installations remain intentionally unimplemented. See
-> [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) and
+> [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md),
+> [`src-tauri/CATALOG.md`](src-tauri/CATALOG.md), and
 > [`src-tauri/HARDWARE_INTEGRATION.md`](src-tauri/HARDWARE_INTEGRATION.md) for the design.
 
 ## Stack
@@ -306,10 +307,11 @@ never receives a connection or executes a query.
 
 The database is split into two independent components:
 
-| Component              | Location                                                       | Access    | Purpose                                                                     |
-| ---------------------- | -------------------------------------------------------------- | --------- | --------------------------------------------------------------------------- |
-| User database          | `%APPDATA%\com.opendrvr.desktop\opendrvr.sqlite3`              | Writable  | Preferences, configuration, scan history, download history, cached metadata |
-| Bundled driver catalog | `<install>\resources\catalog\catalog.sqlite3` (Tauri resource) | Read-only | Hardware identifiers, manufacturers, driver metadata, official sources      |
+| Component              | Location                                                              | Access    | Purpose                                                                     |
+| ---------------------- | --------------------------------------------------------------------- | --------- | --------------------------------------------------------------------------- |
+| User database          | `%APPDATA%\com.opendrvr.desktop\opendrvr.sqlite3`                     | Writable  | Preferences, configuration, scan history, download history, cached metadata |
+| Bundled driver catalog | `<install>\resources\catalog\catalog.sqlite3` (Tauri resource)        | Read-only | Hardware identifiers, manufacturers, driver metadata, official sources      |
+| Catalog updates        | `%APPDATA%\com.opendrvr.desktop\catalog-updates\*.sqlite3` (optional) | Read-only | Additional immutable snapshots; the highest valid version wins              |
 
 The user database file name is configurable through `database.fileName` but is always resolved
 inside Tauri's per-user app data directory. It survives application upgrades and is never touched
@@ -327,20 +329,24 @@ version 2):
 - `cached_driver_metadata` — cached driver payloads with expiry and ETag.
 - `user_configuration` — structured JSON configuration documents.
 
-Bundled catalog (schema version 1, `resources/catalog/schema.sql`):
+Bundled catalog (schema version 2, `resources/catalog/schema.sql`):
 
-- `catalog_meta` — catalog format and schema version.
+- `catalog_meta` — schema version, catalog format, content version, generation and verification
+  timestamps, and source policy version.
 - `manufacturers` — vendor metadata.
-- `hardware_devices` — PCI/USB identifiers, subsystem IDs, class and revision.
-- `driver_sources` — official manufacturer/Windows Update/OEM sources.
-- `drivers` — driver name, version, release date, download metadata and checksum.
-- `driver_hardware` — driver-to-hardware matches.
+- `hardware_devices` — unique PCI/USB/ACPI/HDAUDIO identifiers, subsystem IDs, class and revision.
+- `driver_sources` — official manufacturer/Windows Update/OEM sources with attribution.
+- `drivers` — driver name, provider, version, release date, package type, download metadata and
+  checksum.
+- `driver_hardware` — driver-to-hardware matches with match quality and evidence.
 - `driver_windows_compat` — supported Windows versions and architectures (`x86`, `x64`, `arm64`).
-- `driver_source_refs` — official source URLs per driver.
+- `driver_source_refs` — official source URLs and retrieval timestamps per driver.
 
-The shipped catalog contains schema and metadata only. Hardware and driver rows will be added when
-real catalog data is available; no records are invented. Future catalog updates should ship a new
-immutable snapshot, not mutate the installed file.
+The shipped catalog contains schema and metadata only (`catalog_version` `0.0.0`). Hardware and
+driver rows are added only from verified sources through the import tool; no records are invented.
+Catalog updates are new immutable snapshots. At startup the runtime selects the highest valid
+snapshot from the update directory that is newer than the bundled one, and ignores invalid files.
+Removing an update rolls back to the bundled catalog without touching user data.
 
 ### Initialization and recovery
 
@@ -348,15 +354,17 @@ immutable snapshot, not mutate the installed file.
   timeout and a bounded connection pool, then runs SQLx migrations and `PRAGMA quick_check`.
   If initialization fails, the file (and `-wal`/`-shm` sidecars) is renamed to
   `opendrvr.sqlite3.corrupt-<unix>` and a fresh database is created once.
-- Bundled catalog: opened with SQLite's `read_only` flag. A missing or broken catalog is logged and
-  reported through health checks; it does not prevent the application from starting.
+- Bundled catalog: opened with SQLite's `read_only` flag. Update snapshots in the per-user update
+  directory are validated independently; the highest valid newer version is used, otherwise the
+  bundled snapshot is used. A missing or broken catalog is logged and reported through health
+  checks; it does not prevent the application from starting.
 - Startup never crashes because a database is unavailable. The UI shows the affected component as
   unavailable instead.
 
 ### Commands
 
-- `get_database_health` — live status, schema version, table count, writability and catalog
-  manufacturer count.
+- `get_database_health` — live status, schema version, table count, writability, catalog origin and
+  content version, and catalog record counts.
 - `get_preferences` — reads the typed preference set, applying defaults for missing or malformed
   individual values.
 - `update_preferences` — trims and validates the complete preference set, writes it in one
@@ -377,7 +385,7 @@ Preferences are stored as individual keys in `app_preferences`:
 Defaults, key mapping, validation, and normalization live in Rust. React sends only typed values; no
 SQL text is accepted from the frontend.
 
-### Regenerating the catalog
+### Regenerating and importing the catalog
 
 After editing `src-tauri/resources/catalog/schema.sql`:
 
@@ -386,8 +394,24 @@ cd src-tauri
 cargo run --example build_catalog
 ```
 
-This rewrites `resources/catalog/catalog.sqlite3` from the schema. The generated file is bundled
-through `tauri.conf.json` as `catalog/catalog.sqlite3`.
+This rewrites `resources/catalog/catalog.sqlite3` as a schema-only snapshot with deterministic
+metadata. The generated file is bundled through `tauri.conf.json` as `catalog/catalog.sqlite3`.
+
+Verified catalog records are imported from a JSON document:
+
+```powershell
+# Validate without writing anything
+cargo run --example import_catalog -- --input catalog.json --validate-only
+
+# Write a standalone snapshot, or install a versioned update snapshot
+cargo run --example import_catalog -- --input catalog.json --output catalog.sqlite3
+cargo run --example import_catalog -- --input catalog.json --updates-dir "$env:APPDATA\com.opendrvr.desktop\catalog-updates"
+```
+
+The importer rejects malformed metadata, duplicate records, unknown references, invalid checksums,
+unsafe file names, and non-official URLs before creating a file. See
+[`src-tauri/CATALOG.md`](src-tauri/CATALOG.md) for the document format, validation rules, source
+policy, and update workflow.
 
 ## Windows x64 notes
 
