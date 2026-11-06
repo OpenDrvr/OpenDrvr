@@ -16,6 +16,14 @@ export type HardwareScanState =
 export function useHardwareScan() {
   const [state, setState] = useState<HardwareScanState>({ status: "loading" });
   const requestId = useRef(0);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   const run = useCallback(async () => {
     const currentRequest = requestId.current + 1;
@@ -23,11 +31,11 @@ export function useHardwareScan() {
 
     try {
       const snapshot = await scanHardware();
-      if (requestId.current === currentRequest) {
+      if (mounted.current && requestId.current === currentRequest) {
         setState({ status: "ready", snapshot });
       }
     } catch (error) {
-      if (requestId.current === currentRequest) {
+      if (mounted.current && requestId.current === currentRequest) {
         setState({ status: "error", message: describeError(error) });
       }
     }

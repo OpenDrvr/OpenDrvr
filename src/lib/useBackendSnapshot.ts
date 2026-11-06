@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { describeError } from "./errors";
 import {
   getAppInfo,
@@ -23,6 +23,14 @@ export type BackendSnapshotState =
 /** Loads the real application, module and database state exposed by Rust. */
 export function useBackendSnapshot() {
   const [state, setState] = useState<BackendSnapshotState>({ status: "loading" });
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -31,9 +39,13 @@ export function useBackendSnapshot() {
         getBackendStatus(),
         getDatabaseHealth(),
       ]);
-      setState({ status: "ready", snapshot: { app, backend, database } });
+      if (mounted.current) {
+        setState({ status: "ready", snapshot: { app, backend, database } });
+      }
     } catch (error) {
-      setState({ status: "error", message: describeError(error) });
+      if (mounted.current) {
+        setState({ status: "error", message: describeError(error) });
+      }
     }
   }, []);
 

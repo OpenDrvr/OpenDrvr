@@ -20,6 +20,17 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Registered first so a second process exits before touching shared
+        // state. The existing window is focused instead of spawning a copy.
+        .plugin(tauri_plugin_single_instance::init(
+            |app, _arguments, _cwd| {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            },
+        ))
         .setup(|app| {
             // Configuration is loaded before logging so `config.json` controls
             // the subscriber. A malformed file aborts startup instead of being
