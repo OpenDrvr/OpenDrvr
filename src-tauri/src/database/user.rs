@@ -19,12 +19,47 @@ pub struct UserDatabase {
     schema_version: i64,
 }
 
+/// Why opening the database failed.
+///
+/// Only [`OpenFailure::Corruption`] justifies moving the file aside. Busy,
+/// locked, permission, and I/O failures leave a healthy database intact and
+/// must never trigger recovery.
+#[derive(Debug)]
+enum OpenFailure {
+    Corruption(AppError),
+    Unavailable(AppError),
+}
+
+impl OpenFailure {
+    fn from_sqlx(context: &str, error: sqlx::Error) -> Self {
+        let unavailable = is_operational_error(&error);
+        let error = db_error(context, error);
+
+        if unavailable {
+            Self::Unavailable(error)
+        } else {
+            Self::Corruption(error)
+        }
+    }
+
+    fn corruption(error: AppError) -> Self {
+        Self::Corruption(error)
+    }
+
+    fn into_error(self) -> AppError {
+        match self {
+            Self::Corruption(error) | Self::Unavailable(error) => error,
+        }
+    }
+}
+
 impl UserDatabase {
     /// Opens the database, runs migrations, and verifies integrity.
     ///
-    /// If the existing file cannot be opened or migrated, it is quarantined and
-    /// a fresh database is created once. The original file is retained with a
-    /// `.corrupt-<timestamp>` suffix for diagnostics.
+    /// If the existing file is actually corrupt, it is quarantined and a fresh
+    /// database is created once. Transient failures — another process holding
+    /// a lock, denied permissions, or an I/O error — are reported without
+    /// touching the file so a healthy database cannot be sidelined.
     pub async fn initialize(path: &Path) -> AppResult<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -32,29 +67,37 @@ impl UserDatabase {
 
         match Self::open(path).await {
             Ok(database) => Ok(database),
-            Err(first_error) => {
+            Err(OpenFailure::Unavailable(error)) => {
+                tracing::error!(
+                    error = %error,
+                    "user database is unavailable; preserving the existing file"
+                );
+                Err(error)
+            }
+            Err(OpenFailure::Corruption(first_error)) => {
                 tracing::warn!(
                     error = %first_error,
-                    "user database failed to initialize; attempting recovery"
+                    "user database appears corrupt; attempting recovery"
                 );
 
                 if let Some(backup) = quarantine(path)? {
                     tracing::warn!(
                         backup = %backup.display(),
-                        "quarantined unreadable user database"
+                        "quarantined corrupt user database"
                     );
                 }
 
                 Self::open(path).await.map_err(|second_error| {
                     AppError::Database(format!(
-                        "user database recovery failed (first attempt: {first_error}; retry: {second_error})"
+                        "user database recovery failed (first attempt: {first_error}; retry: {})",
+                        second_error.into_error()
                     ))
                 })
             }
         }
     }
 
-    async fn open(path: &Path) -> AppResult<Self> {
+    async fn open(path: &Path) -> Result<Self, OpenFailure> {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -68,11 +111,11 @@ impl UserDatabase {
             .acquire_timeout(Duration::from_secs(10))
             .connect_with(options)
             .await
-            .map_err(|error| db_error("failed to open user database", error))?;
+            .map_err(|error| OpenFailure::from_sqlx("failed to open user database", error))?;
 
         if let Err(error) = sqlx::migrate!("./migrations").run(&pool).await {
             pool.close().await;
-            return Err(db_error("failed to migrate user database", error));
+            return Err(migrate_failure(error));
         }
 
         if let Err(error) = integrity_check(&pool).await {
@@ -80,7 +123,16 @@ impl UserDatabase {
             return Err(error);
         }
 
-        let schema_version = schema_version(&pool).await?;
+        let schema_version = match schema_version(&pool).await {
+            Ok(version) => version,
+            Err(error) => {
+                pool.close().await;
+                return Err(OpenFailure::from_sqlx(
+                    "failed to read user schema version",
+                    error,
+                ));
+            }
+        };
 
         Ok(Self {
             pool,
@@ -94,13 +146,19 @@ impl UserDatabase {
 
     pub async fn health(&self) -> AppResult<UserDatabaseHealth> {
         let tables = table_count(&self.pool).await?;
+        let writable = writability_probe(&self.pool).await;
 
         Ok(UserDatabaseHealth {
-            status: crate::database::models::DatabaseComponentStatus::Ok,
+            status: if writable {
+                crate::database::models::DatabaseComponentStatus::Ok
+            } else {
+                crate::database::models::DatabaseComponentStatus::Unavailable
+            },
             schema_version: self.schema_version,
             tables,
-            writable: true,
-            message: None,
+            writable,
+            message: (!writable)
+                .then(|| "User database is read-only; preferences cannot be saved.".to_string()),
         })
     }
 
@@ -171,28 +229,98 @@ impl UserDatabase {
     }
 }
 
-async fn schema_version(pool: &SqlitePool) -> AppResult<i64> {
+async fn schema_version(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success = 1",
     )
     .fetch_one(pool)
     .await
-    .map_err(|error| db_error("failed to read user schema version", error))
 }
 
-async fn integrity_check(pool: &SqlitePool) -> AppResult<()> {
+async fn integrity_check(pool: &SqlitePool) -> Result<(), OpenFailure> {
     let result = sqlx::query_scalar::<_, String>("PRAGMA quick_check")
         .fetch_one(pool)
         .await
-        .map_err(|error| db_error("failed to run user database integrity check", error))?;
+        .map_err(|error| {
+            OpenFailure::from_sqlx("failed to run user database integrity check", error)
+        })?;
 
     if result.eq_ignore_ascii_case("ok") {
         Ok(())
     } else {
-        Err(AppError::Database(format!(
+        Err(OpenFailure::corruption(AppError::Database(format!(
             "user database integrity check failed: {result}"
+        ))))
+    }
+}
+
+/// Acquires a write transaction and rolls it back, proving the database is
+/// writable without leaving a row behind.
+async fn writability_probe(pool: &SqlitePool) -> bool {
+    let Ok(mut transaction) = pool.begin().await else {
+        return false;
+    };
+
+    let wrote = sqlx::query(
+        "INSERT INTO app_preferences (key, value)
+         VALUES ('__opendrvr_health_probe', '1')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(&mut *transaction)
+    .await
+    .is_ok();
+
+    if transaction.rollback().await.is_err() {
+        return false;
+    }
+
+    wrote
+}
+
+/// Classifies a migration failure without assuming a specific SQLx error
+/// variant. Anything caused by a SQLite operational error (busy, locked,
+/// permission, read-only, disk full, I/O) preserves the file.
+fn migrate_failure(error: sqlx::migrate::MigrateError) -> OpenFailure {
+    if error_chain_has_operational_error(&error) {
+        OpenFailure::Unavailable(AppError::Database(format!(
+            "failed to migrate user database: {error}"
+        )))
+    } else {
+        OpenFailure::Corruption(AppError::Database(format!(
+            "failed to migrate user database: {error}"
         )))
     }
+}
+
+fn error_chain_has_operational_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = error.source();
+
+    while let Some(source) = current {
+        if let Some(error) = source.downcast_ref::<sqlx::Error>() {
+            return is_operational_error(error);
+        }
+        current = source.source();
+    }
+
+    false
+}
+
+fn is_operational_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(database) => database
+            .code()
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(operational_sqlite_code),
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => true,
+        _ => false,
+    }
+}
+
+/// SQLite primary result codes that mean "cannot use right now" rather than
+/// "the file is damaged": permission, busy, locked, read-only, I/O, full, and
+/// unable to open.
+fn operational_sqlite_code(code: i32) -> bool {
+    matches!(code, 3 | 5 | 6 | 8 | 10 | 13 | 14)
 }
 
 /// Moves a broken database (and its WAL sidecars) aside before a retry.
@@ -389,5 +517,86 @@ mod tests {
         assert_eq!(health.schema_version, 2);
         assert_eq!(health.tables, 6);
         assert!(health.writable);
+        assert!(health.message.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_only_database_is_reported_as_not_writable() {
+        let dir = TestDir::new("user-read-only");
+        let path = dir.path().join("opendrvr.sqlite3");
+        UserDatabase::initialize(&path).await.expect("initialize");
+
+        let read_only = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(read_only)
+            .await
+            .expect("read-only pool");
+
+        assert!(!writability_probe(&pool).await);
+        pool.close().await;
+    }
+
+    #[test]
+    fn operational_sqlite_codes_are_not_corruption() {
+        for code in [3, 5, 6, 8, 10, 13, 14] {
+            assert!(operational_sqlite_code(code), "code {code}");
+        }
+
+        for code in [11, 26] {
+            assert!(!operational_sqlite_code(code), "code {code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn locked_database_error_is_classified_as_operational() {
+        use sqlx::Connection;
+
+        let dir = TestDir::new("user-locked");
+        let path = dir.path().join("opendrvr.sqlite3");
+
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut lock = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("lock connection");
+        sqlx::query("CREATE TABLE probe (value INTEGER)")
+            .execute(&mut lock)
+            .await
+            .expect("create probe table");
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut lock)
+            .await
+            .expect("take exclusive lock");
+
+        let contender = SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .busy_timeout(Duration::from_millis(100)),
+            )
+            .await
+            .expect("contender pool");
+
+        let error = sqlx::query("CREATE TABLE contender (value INTEGER)")
+            .execute(&contender)
+            .await
+            .expect_err("the database is locked");
+
+        assert!(
+            is_operational_error(&error),
+            "expected a busy/locked error, got {error}"
+        );
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut lock)
+            .await
+            .expect("release lock");
+        contender.close().await;
     }
 }

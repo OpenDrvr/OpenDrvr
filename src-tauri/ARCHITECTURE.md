@@ -131,6 +131,14 @@ and makes the IPC boundary the only coupling between React and Rust.
 
 ## Decisions
 
+### Single instance
+
+`tauri-plugin-single-instance` is registered before the rest of the builder. A
+second launch exits immediately and focuses the existing window instead of
+opening the same user database, running migrations, or competing for recovery
+against the first process. WAL and the busy timeout remain a safety net, not the
+primary concurrency control.
+
 ### Centralized immutable state
 
 `AppState` is constructed once during Tauri `setup` and registered with
@@ -230,10 +238,26 @@ applied version is read from `_sqlx_migrations`.
 `Database::initialize` runs during Tauri `setup` and is intentionally
 non-fatal. The user database creates its parent directory, opens a pool with WAL,
 foreign keys, a 5-second busy timeout and at most five connections, then runs
-migrations and `PRAGMA quick_check`. If any step fails, the file and its
-`-wal`/`-shm` sidecars are renamed with a `.corrupt-<unix>` suffix and a fresh
-database is created once. A second failure leaves the component unavailable
-rather than aborting startup.
+migrations and `PRAGMA quick_check`.
+
+Recovery is reserved for actual corruption. Failures are classified before the
+file is touched:
+
+- **Preserved (unavailable):** `SQLITE_PERM`, `SQLITE_BUSY`, `SQLITE_LOCKED`,
+  `SQLITE_READONLY`, `SQLITE_IOERR`, `SQLITE_FULL`, `SQLITE_CANTOPEN`, pool
+  timeouts, closed pools, and I/O errors. These are reported without renaming
+  anything, so a second instance holding a lock cannot sideline a healthy
+  database.
+- **Quarantined (corruption):** integrity-check failures, `SQLITE_CORRUPT`,
+  `SQLITE_NOTADB`, and migration failures not caused by an operational error.
+
+A quarantined file and its `-wal`/`-shm` sidecars are renamed with a
+`.corrupt-<unix>` suffix and a fresh database is created once. A second failure
+leaves the component unavailable rather than aborting startup.
+
+Health reports a live writability probe, not just a successful open: it acquires
+a write transaction, rolls it back, and reports `writable: false` with an
+unavailable status when the file cannot be written.
 
 A missing or unreadable catalog is logged and reported as unavailable; the user
 database and the rest of the application continue to work. Health commands
@@ -361,10 +385,10 @@ instance-ID deduplication, command error sanitization, and a real-hardware
 enumeration of the local device tree.
 
 Database tests cover initial creation, reopening with persisted preferences,
-migration output, corrupt-file recovery, catalog read-only access, missing
-catalog degradation, bundled/user separation, atomic preference writes, reset,
-invalid-input rejection before writing, and preference persistence across a
-reopen. Run them with:
+migration output, corrupt-file recovery, locked-database classification,
+live read-only detection, catalog read-only access, missing catalog degradation,
+bundled/user separation, atomic preference writes, reset, invalid-input rejection
+before writing, and preference persistence across a reopen. Run them with:
 
 ```powershell
 cargo test --all-targets

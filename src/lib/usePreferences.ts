@@ -20,13 +20,25 @@ export function usePreferences() {
   const [state, setState] = useState<PreferencesState>({ status: "loading" });
   const [pendingAction, setPendingAction] = useState<PreferenceAction | null>(null);
   const pendingRef = useRef(false);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     try {
       const preferences = await getPreferences();
-      setState({ status: "ready", preferences });
+      if (mounted.current) {
+        setState({ status: "ready", preferences });
+      }
     } catch (error) {
-      setState({ status: "error", message: describeError(error) });
+      if (mounted.current) {
+        setState({ status: "error", message: describeError(error) });
+      }
     }
   }, []);
 
@@ -42,23 +54,30 @@ export function usePreferences() {
     await load();
   }, [load]);
 
-  const save = useCallback(async (preferences: AppPreferences): Promise<AppPreferences | null> => {
-    if (pendingRef.current) {
-      return null;
-    }
+  const save = useCallback(
+    async (preferences: AppPreferences): Promise<AppPreferences | null> => {
+      if (pendingRef.current) {
+        return null;
+      }
 
-    pendingRef.current = true;
-    setPendingAction("save");
+      pendingRef.current = true;
+      setPendingAction("save");
 
-    try {
-      const saved = await updatePreferences(preferences);
-      setState({ status: "ready", preferences: saved });
-      return saved;
-    } finally {
-      pendingRef.current = false;
-      setPendingAction(null);
-    }
-  }, []);
+      try {
+        const saved = await updatePreferences(preferences);
+        if (mounted.current) {
+          setState({ status: "ready", preferences: saved });
+        }
+        return saved;
+      } finally {
+        pendingRef.current = false;
+        if (mounted.current) {
+          setPendingAction(null);
+        }
+      }
+    },
+    [mounted],
+  );
 
   const reset = useCallback(async (): Promise<AppPreferences | null> => {
     if (pendingRef.current) {
@@ -70,11 +89,15 @@ export function usePreferences() {
 
     try {
       const defaults = await resetPreferences();
-      setState({ status: "ready", preferences: defaults });
+      if (mounted.current) {
+        setState({ status: "ready", preferences: defaults });
+      }
       return defaults;
     } finally {
       pendingRef.current = false;
-      setPendingAction(null);
+      if (mounted.current) {
+        setPendingAction(null);
+      }
     }
   }, []);
 
