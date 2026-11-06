@@ -3,9 +3,16 @@
 **Open Driver** — an open-source Windows utility for identifying computer hardware, discovering
 compatible drivers, and providing downloads from official manufacturer sources.
 
-> Status: **Phase 2 — backend architecture.** Hardware detection, driver lookup, downloads, and
-> installations are intentionally not implemented yet. See
-> [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) for the backend design.
+> Status: **Phase 10 — Hardware identification and classification.** The Rust backend enumerates the
+> live Plug and Play device tree with CfgMgr32, including present and non-present devices. It parses
+> PCI, USB, ACPI, and HD Audio identifiers; resolves known vendor and subsystem vendors from a
+> curated, maintainable table; and classifies devices into useful categories. Reported manufacturer,
+> hardware vendor, subsystem vendor, and driver provider remain distinct. The Hardware page shows
+> identity confidence (confirmed, partial, or unresolved), parsed identifier details, categories,
+> driver metadata, and raw identifiers for future matching. Driver catalog matching, downloads, and
+> installations remain intentionally unimplemented. See
+> [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) and
+> [`src-tauri/HARDWARE_INTEGRATION.md`](src-tauri/HARDWARE_INTEGRATION.md) for the design.
 
 ## Stack
 
@@ -14,9 +21,12 @@ compatible drivers, and providing downloads from official manufacturer sources.
 | Desktop  | Tauri 2 (WebView2)                            |
 | Backend  | Rust (stable, MSVC toolchain)                 |
 | Frontend | React 19 + TypeScript 6 (strict mode)         |
+| Database | SQLite via SQLx 0.8 (bundled, no server)      |
+| Windows  | `windows-rs` 0.62 (CfgMgr32, Windows-only)    |
 | Bundler  | Vite 8                                        |
-| Styling  | Tailwind CSS 4                                |
+| Styling  | Tailwind CSS 4 (dark-first design tokens)     |
 | Icons    | Lucide React                                  |
+| UI       | Custom React component library                |
 | Tooling  | pnpm 12, ESLint 10, Prettier 3, Cargo/rustfmt |
 | Target   | Windows 10 / Windows 11 x64                   |
 
@@ -72,26 +82,45 @@ Release artifacts are written under
 ```text
 .
 ├── src/                      React + TypeScript frontend
-│   ├── App.tsx               Application shell and backend status panel
+│   ├── App.tsx               Persistent shell: sidebar, page routing, backend snapshot
 │   ├── main.tsx              React entry point
-│   ├── index.css             Tailwind import, theme, base styles
-│   └── lib/tauri.ts          Typed wrapper around Tauri IPC
+│   ├── index.css             Tailwind import, dark/purple tokens, base styles
+│   ├── components/
+│   │   ├── layout/           Sidebar, page headers, About dialog
+│   │   └── ui/               Buttons, inputs, tables, dialogs, toasts, status, empty states
+│   ├── pages/                Overview, Hardware, Drivers, Downloads, Settings
+│   └── lib/
+│       ├── tauri.ts          Typed IPC wrappers, error normalization, preference DTOs
+│       ├── errors.ts         Unknown-error to user-safe message conversion
+│       ├── navigation.ts     Page definitions and hash parsing
+│       ├── useAppNavigation.ts  Hash-based desktop navigation
+│       ├── useBackendSnapshot.ts  App, module, and database status loading
+│       ├── useHardwareScan.ts Real hardware scan with latest-request-wins refresh
+│       ├── usePreferences.ts Persisted preference loading, saving and reset
+│       ├── toast.ts          Toast context contract
+│       └── cn.ts             Conditional class names
 ├── src-tauri/
 │   ├── src/lib.rs            Tauri builder, startup, and state registration
 │   ├── src/main.rs           Windows desktop entry point
 │   ├── src/commands/         Thin IPC adapters and command registration
-│   ├── src/hardware/         Hardware identification boundary
+│   ├── src/hardware/         Portable model, IDs, identification, vendors, status, categories
 │   ├── src/drivers/          Driver discovery boundary
 │   ├── src/sources/          Official source registry boundary
-│   ├── src/database/         Local persistence boundary
+│   ├── src/database/         Embedded SQLite: user database and bundled catalog
 │   ├── src/downloads/        Download orchestration boundary
 │   ├── src/platform/         Platform helpers and Windows-only integration
+│   │   └── windows/          CfgMgr32 device enumeration (device_tree.rs)
 │   ├── src/config.rs         Typed configuration and validation
 │   ├── src/error.rs          Internal and IPC error types
 │   ├── src/logging.rs        Structured logging setup
+│   ├── src/preferences.rs    Typed preferences, defaults, validation and key mapping
 │   ├── src/state.rs          Central application state
 │   ├── src/utils/            Shared validation helpers
+│   ├── migrations/           Versioned user-database migrations
+│   ├── resources/catalog/    Catalog schema and read-only SQLite snapshot
+│   ├── examples/             Maintenance tools (catalog regeneration)
 │   ├── ARCHITECTURE.md       Backend design and decisions
+│   ├── HARDWARE_INTEGRATION.md  Windows API assessment and hardware design
 │   ├── capabilities/         Tauri 2 window capabilities
 │   ├── icons/                Windows icon assets
 │   ├── build.rs              Tauri build script
@@ -108,13 +137,26 @@ Release artifacts are written under
 
 ## Frontend ↔ Rust communication
 
-The frontend calls the Rust command through Tauri's IPC bridge:
+Every frontend call goes through a single typed wrapper, so runtime checks and error normalization
+cannot drift between commands:
 
 ```ts
 // src/lib/tauri.ts
-import { invoke } from "@tauri-apps/api/core";
+async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  requireTauriRuntime();
 
-export const getAppInfo = () => invoke<AppInfo>("get_app_info");
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    if (isCommandErrorPayload(error)) {
+      throw new IpcError(error);
+    }
+
+    throw error;
+  }
+}
+
+export const getAppInfo = () => invokeCommand<AppInfo>("get_app_info");
 ```
 
 ```rust
@@ -134,8 +176,12 @@ macro_rules! generate_command_handlers {
     () => {
         tauri::generate_handler![
             $crate::commands::app::get_app_info,
+            $crate::commands::database::get_database_health,
+            $crate::commands::hardware::scan_hardware,
+            $crate::commands::preferences::get_preferences,
+            $crate::commands::preferences::reset_preferences,
+            $crate::commands::preferences::update_preferences,
             $crate::commands::system::get_backend_status,
-            $crate::commands::system::ping,
         ]
     };
 }
@@ -144,12 +190,204 @@ macro_rules! generate_command_handlers {
 .invoke_handler(crate::generate_command_handlers!())
 ```
 
-The UI displays the returned values in the **Rust backend connection** panel, which doubles as an
-end-to-end IPC check. `get_backend_status` reports each domain module's lifecycle state, and `ping`
-is a harmless round-trip command that demonstrates input validation and typed error handling.
+Only commands used by the frontend are registered. There is no generic query, SQL, or diagnostic
+command.
 
-Errors cross the IPC boundary as `{ code, message }`. Internal details (paths, OS errors) are
-logged with `tracing` and never exposed to the webview.
+The UI loads application, module, and database values once into a backend snapshot and presents them
+on the Overview page, in the Settings local-data panel, in the sidebar status card, and in the About
+dialog. `get_backend_status` reports each domain module's lifecycle state.
+
+Settings reads and writes go through `usePreferences`, which exposes loading, ready, and error states
+plus a pending action. Saves send the complete typed preference set, and Rust returns the canonical
+stored value after trimming and validation; the UI never invents a value the database did not accept.
+Overlapping writes are blocked while an action is pending.
+
+Errors cross the IPC boundary as `{ code, message }`. The wrapper converts them into an `IpcError`
+with the stable backend code attached. Internal details (paths, OS errors) are logged with `tracing`
+and never exposed to the webview.
+
+## Desktop UI
+
+The frontend is a Windows desktop shell, not a website. It uses a persistent 236 px sidebar with
+application branding, grouped navigation (Overview, Hardware, Drivers, Downloads, Settings), live
+backend and local-data status, the application version, and an About dialog. The main content area
+scrolls independently and the layout is verified down to the configured minimum window size.
+
+Design system:
+
+- Near-black and charcoal surfaces with a faint violet undertone.
+- Electric purple (`#8b5cf6`) as the primary accent.
+- Segoe UI Variable typography, subtle 1 px borders, restrained shadows, and small radii.
+- Tokens live in `src/index.css` through Tailwind's `@theme`; no shadcn/ui or dashboard template is
+  used.
+- Custom components in `src/components/ui`: buttons, icon buttons, inputs, search fields, dropdowns,
+  tabs, tables, status indicators, native dialogs, tooltips, empty states, spinners/skeletons, switches,
+  and toast notifications.
+- Layout components in `src/components/layout`: sidebar, page/section headers, and About dialog.
+
+Navigation is hash-based (`#/overview`, `#/hardware`, and so on) through `useAppNavigation`, so
+browser-style back/forward works without a router dependency. The current page is also exposed with
+`aria-current="page"` for assistive technology.
+
+The initial pages are deliberately honest:
+
+- **Overview** introduces OpenDrvr, its principles, and the real backend module states.
+- **Hardware** reads the real Windows device tree through `scan_hardware`. It shows summary counts,
+  searchable and filterable devices, identification coverage, scan errors, empty and loading states,
+  a refresh action, and a detail panel with parsed identifiers, identified vendors, driver metadata,
+  status, and location. **Drivers** and **Downloads** remain planned. No hardware, driver status, or
+  transfer data is invented.
+- **Settings** reads and writes real preferences through Rust: theme, update channel, download folder,
+  and three download/update switches. Changes are tracked as a draft with explicit **Save changes**,
+  **Discard**, and **Restore defaults** actions, inline validation, loading skeletons, error states,
+  and success/error notifications. The local-data panel shows real schema and catalog values from
+  Rust.
+
+`__APP_VERSION__` is injected from `package.json` by `vite.config.ts` and used by the sidebar and
+About dialog.
+
+## Hardware integration
+
+Phase 10 builds identification on top of the native enumerator. The `scan_hardware` command runs the
+synchronous CfgMgr32 scan on a blocking worker and returns a serializable snapshot. The Hardware page
+loads that snapshot on mount and can rescan on demand. Scans are not persisted yet, and no catalog
+matching or driver installation happens.
+
+The primary API is **CfgMgr32** (`cfgmgr32.dll`) through `windows-rs`. It enumerates all installed
+Plug and Play device nodes, locates present devices normally, falls back to the phantom flag for
+non-present devices, and reads device and driver properties plus Configuration Manager status flags
+and problem codes. SetupAPI is reserved for future read-only INF and driver-package inspection;
+WMI/CIM is reserved for supplemental facts such as CPU model, GPU memory, motherboard model, BIOS
+version, and physical memory.
+
+The backend reads and preserves:
+
+- the device instance ID and enumerator
+- hardware IDs and compatible IDs, in the order Windows reports them
+- best-effort PCI, USB, ACPI, and HD Audio fields, while keeping malformed IDs verbatim
+- device class, class GUID, manufacturer, friendly name, and description
+- parent instance ID, location information, bus number, and address
+- driver provider, version, date, description, INF file name, and service name
+- device state, raw problem code, and a coarse problem classification
+- a user-facing condition: healthy, disabled, problem, missing driver, non-present, or unknown
+- an identification result: preferred manufacturer, hardware vendor, subsystem vendor, identifier
+  families, notes, and a confidence of confirmed, partial, or unresolved
+
+Identification uses a curated vendor table for PCI, USB, ACPI, and HD Audio IDs. Reported names and
+manufacturers are preserved but are never treated as confirmed identity on their own. Unknown or
+incomplete identifiers remain unresolved, and conflicting Windows metadata lowers the result to
+partial rather than rewriting the raw data. Categories cover processor, graphics, motherboard,
+chipset, network, audio, Bluetooth, USB, storage, input, and other devices.
+
+Device instance IDs are deduplicated case-insensitively, and results are sorted for deterministic
+output. The scanner emits a record even when optional properties are missing. Property and device
+read failures are collected in scan diagnostics and logged without aborting the rest of the scan.
+
+The `hardware` module stays portable and Tauri-free. It owns the data model and
+the `DeviceEnumerator` trait. `platform::windows::device_tree` is the only code
+that calls CfgMgr32, and `AppState` injects the platform provider into
+`HardwareService`. This keeps the unsafe Win32 surface small and lets tests use a
+fake enumerator.
+
+Standard users can enumerate devices and read most properties. Some properties
+may be denied; the scanner records those as diagnostics and continues. Driver
+installation, driver-store changes, and some WMI classes require administrator
+rights and are not part of Phase 10. OpenDrvr does not auto-elevate.
+
+See [`src-tauri/HARDWARE_INTEGRATION.md`](src-tauri/HARDWARE_INTEGRATION.md) for
+the full API assessment, data model, privileges, compatibility notes, and the
+next-phase catalog-matching boundary.
+
+## Embedded database
+
+OpenDrvr uses embedded SQLite through SQLx 0.8 with the bundled SQLite build. No external database
+server or user setup is required. All SQL stays inside Rust; React only calls typed commands and
+never receives a connection or executes a query.
+
+The database is split into two independent components:
+
+| Component              | Location                                                       | Access    | Purpose                                                                     |
+| ---------------------- | -------------------------------------------------------------- | --------- | --------------------------------------------------------------------------- |
+| User database          | `%APPDATA%\com.opendrvr.desktop\opendrvr.sqlite3`              | Writable  | Preferences, configuration, scan history, download history, cached metadata |
+| Bundled driver catalog | `<install>\resources\catalog\catalog.sqlite3` (Tauri resource) | Read-only | Hardware identifiers, manufacturers, driver metadata, official sources      |
+
+The user database file name is configurable through `database.fileName` but is always resolved
+inside Tauri's per-user app data directory. It survives application upgrades and is never touched
+by catalog updates.
+
+### Schemas
+
+User database (migrations `0001_user_initial.sql` and `0002_user_configuration.sql`, schema
+version 2):
+
+- `app_preferences` — key/value preferences with update timestamps.
+- `hardware_scans` — scan runs with status and summary.
+- `hardware_scan_devices` — per-scan PCI/USB devices and optional details.
+- `download_history` — download attempts, progress and outcome.
+- `cached_driver_metadata` — cached driver payloads with expiry and ETag.
+- `user_configuration` — structured JSON configuration documents.
+
+Bundled catalog (schema version 1, `resources/catalog/schema.sql`):
+
+- `catalog_meta` — catalog format and schema version.
+- `manufacturers` — vendor metadata.
+- `hardware_devices` — PCI/USB identifiers, subsystem IDs, class and revision.
+- `driver_sources` — official manufacturer/Windows Update/OEM sources.
+- `drivers` — driver name, version, release date, download metadata and checksum.
+- `driver_hardware` — driver-to-hardware matches.
+- `driver_windows_compat` — supported Windows versions and architectures (`x86`, `x64`, `arm64`).
+- `driver_source_refs` — official source URLs per driver.
+
+The shipped catalog contains schema and metadata only. Hardware and driver rows will be added when
+real catalog data is available; no records are invented. Future catalog updates should ship a new
+immutable snapshot, not mutate the installed file.
+
+### Initialization and recovery
+
+- User database: creates the directory and file, enables WAL, foreign keys, a 5-second busy
+  timeout and a bounded connection pool, then runs SQLx migrations and `PRAGMA quick_check`.
+  If initialization fails, the file (and `-wal`/`-shm` sidecars) is renamed to
+  `opendrvr.sqlite3.corrupt-<unix>` and a fresh database is created once.
+- Bundled catalog: opened with SQLite's `read_only` flag. A missing or broken catalog is logged and
+  reported through health checks; it does not prevent the application from starting.
+- Startup never crashes because a database is unavailable. The UI shows the affected component as
+  unavailable instead.
+
+### Commands
+
+- `get_database_health` — live status, schema version, table count, writability and catalog
+  manufacturer count.
+- `get_preferences` — reads the typed preference set, applying defaults for missing or malformed
+  individual values.
+- `update_preferences` — trims and validates the complete preference set, writes it in one
+  transaction, and returns the canonical stored value.
+- `reset_preferences` — removes exactly the keys this build owns and returns application defaults.
+
+Preferences are stored as individual keys in `app_preferences`:
+
+| Key                            | Default     | Notes                                  |
+| ------------------------------ | ----------- | -------------------------------------- |
+| `ui.theme`                     | `dark`      | Only `dark` is implemented             |
+| `updates.channel`              | `stable`    | Only `stable` is implemented           |
+| `downloads.directory`          | `Downloads` | Trimmed, 1–260 characters, single line |
+| `updates.check_on_launch`      | `true`      | Boolean                                |
+| `downloads.notify_on_complete` | `true`      | Boolean                                |
+| `downloads.keep_history`       | `true`      | Boolean                                |
+
+Defaults, key mapping, validation, and normalization live in Rust. React sends only typed values; no
+SQL text is accepted from the frontend.
+
+### Regenerating the catalog
+
+After editing `src-tauri/resources/catalog/schema.sql`:
+
+```powershell
+cd src-tauri
+cargo run --example build_catalog
+```
+
+This rewrites `resources/catalog/catalog.sqlite3` from the schema. The generated file is bundled
+through `tauri.conf.json` as `catalog/catalog.sqlite3`.
 
 ## Windows x64 notes
 

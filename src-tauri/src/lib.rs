@@ -7,6 +7,7 @@ mod error;
 mod hardware;
 mod logging;
 mod platform;
+mod preferences;
 mod sources;
 mod state;
 mod utils;
@@ -19,6 +20,17 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Registered first so a second process exits before touching shared
+        // state. The existing window is focused instead of spawning a copy.
+        .plugin(tauri_plugin_single_instance::init(
+            |app, _arguments, _cwd| {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            },
+        ))
         .setup(|app| {
             // Configuration is loaded before logging so `config.json` controls
             // the subscriber. A malformed file aborts startup instead of being
@@ -35,7 +47,15 @@ pub fn run() {
                 "OpenDrvr backend starting"
             );
 
-            app.manage(state::AppState::new(config));
+            let data_dir = platform::data_dir(app.handle());
+            let catalog_path = platform::catalog_path(app.handle());
+            let database = tauri::async_runtime::block_on(database::Database::initialize(
+                &config.database,
+                data_dir.as_deref(),
+                catalog_path.as_deref(),
+            ));
+
+            app.manage(state::AppState::new(config, database));
             Ok(())
         })
         .invoke_handler(crate::generate_command_handlers!())

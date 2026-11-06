@@ -22,7 +22,7 @@
         "fullscreen": false,
         "center": true,
         "theme": "Dark",
-        "backgroundColor": "#070b14"
+        "backgroundColor": "#08080c"
       }
     ],
     "security": {
@@ -38,6 +38,9 @@
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
       }
+    },
+    "resources": {
+      "resources/catalog/catalog.sqlite3": "catalog/catalog.sqlite3"
     }
   }
 }
