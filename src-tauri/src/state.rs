@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::{
     config::AppConfig, database::Database, downloads::DownloadManager, drivers::DriverService,
-    hardware::HardwareService, sources::SourceRegistry,
+    hardware::HardwareService, platform, sources::SourceRegistry,
 };
 
 /// Lifecycle of a backend domain as reported to the frontend.
@@ -53,7 +53,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: AppConfig, database: Database) -> Self {
-        let hardware = HardwareService::new();
+        let hardware = HardwareService::new(platform::device_enumerator());
         let drivers = DriverService::new();
         let sources = SourceRegistry::new();
         let downloads = DownloadManager::new(config.downloads.clone());

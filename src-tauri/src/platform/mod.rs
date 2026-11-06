@@ -5,14 +5,37 @@
 //! portable and makes the unsafe surface easy to audit.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tauri::{AppHandle, Manager};
+
+use crate::hardware::provider::{DeviceEnumerator, UnsupportedDeviceEnumerator};
 
 #[cfg(windows)]
 mod windows;
 
 /// File name of the bundled catalog snapshot inside the resource directory.
 pub const CATALOG_FILE_NAME: &str = "catalog.sqlite3";
+
+/// Returns the platform device enumerator injected into the hardware domain.
+///
+/// Win32 access stays inside `platform::windows`; the hardware domain only sees
+/// the portable [`DeviceEnumerator`] trait. OpenDrvr targets Windows 10/11 on
+/// x64, so other Windows architectures fall back to the unsupported provider.
+#[cfg(windows)]
+pub fn device_enumerator() -> Arc<dyn DeviceEnumerator> {
+    if cfg!(target_arch = "x86_64") {
+        Arc::new(windows::device_tree::WindowsDeviceEnumerator)
+    } else {
+        Arc::new(UnsupportedDeviceEnumerator)
+    }
+}
+
+/// Returns a provider that reports unsupported-platform errors.
+#[cfg(not(windows))]
+pub fn device_enumerator() -> Arc<dyn DeviceEnumerator> {
+    Arc::new(UnsupportedDeviceEnumerator)
+}
 
 /// Human-readable platform identifier exposed to the frontend.
 #[cfg(windows)]

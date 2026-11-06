@@ -70,17 +70,7 @@ impl AppConfig {
             ));
         }
 
-        if self.database.file_name.trim().is_empty() {
-            return Err(AppError::Config(
-                "database.fileName must not be empty".to_string(),
-            ));
-        }
-
-        if self.database.file_name.contains('/') || self.database.file_name.contains('\\') {
-            return Err(AppError::Config(
-                "database.fileName must be a file name, not a path".to_string(),
-            ));
-        }
+        validate_database_file_name(&self.database.file_name)?;
 
         if self.downloads.max_concurrent == 0 {
             return Err(AppError::Config(
@@ -96,6 +86,48 @@ impl AppConfig {
 
         Ok(())
     }
+}
+
+/// Rejects anything that is not a single, ordinary file name.
+///
+/// The value is joined onto the application data directory, so it must not be
+/// able to escape it. Windows also ignores trailing spaces and dots when it
+/// resolves a path, which means `.. ` refers to the parent directory even
+/// though it does not contain a separator. Both cases are rejected here rather
+/// than relying on the filesystem to fail safely.
+fn validate_database_file_name(file_name: &str) -> AppResult<()> {
+    if file_name.trim().is_empty() {
+        return Err(AppError::Config(
+            "database.fileName must not be empty".to_string(),
+        ));
+    }
+
+    if file_name.contains(['/', '\\']) {
+        return Err(AppError::Config(
+            "database.fileName must be a file name, not a path".to_string(),
+        ));
+    }
+
+    // A colon makes the value drive-relative (for example `C:opendrvr.sqlite3`)
+    // and the remaining characters are illegal in Windows file names.
+    if file_name.chars().any(|character| {
+        character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+    }) {
+        return Err(AppError::Config(
+            "database.fileName contains characters that are not allowed in a Windows file name"
+                .to_string(),
+        ));
+    }
+
+    // `.` and `..` both normalize to an empty string here, as do names that
+    // consist only of dots and spaces.
+    if file_name.trim_end_matches([' ', '.']).is_empty() {
+        return Err(AppError::Config(
+            "database.fileName must name a file".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,9 +196,47 @@ mod tests {
 
     #[test]
     fn rejects_path_in_database_file_name() {
-        let mut config = AppConfig::default();
-        config.database.file_name = "nested/db.sqlite3".to_string();
-        assert!(config.validate().is_err());
+        for name in [
+            "nested/db.sqlite3",
+            "nested\\db.sqlite3",
+            "C:opendrvr.sqlite3",
+        ] {
+            let mut config = AppConfig::default();
+            config.database.file_name = name.to_string();
+            assert!(config.validate().is_err(), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_database_file_name_that_can_escape_the_data_directory() {
+        for name in [".", "..", ".. ", " .", "... ", "", "   "] {
+            let mut config = AppConfig::default();
+            config.database.file_name = name.to_string();
+            assert!(config.validate().is_err(), "{name:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_windows_characters_in_database_file_name() {
+        for name in [
+            "db?.sqlite3",
+            "db*.sqlite3",
+            "db|.sqlite3",
+            "db\u{0}.sqlite3",
+        ] {
+            let mut config = AppConfig::default();
+            config.database.file_name = name.to_string();
+            assert!(config.validate().is_err(), "{name:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn accepts_ordinary_database_file_names() {
+        for name in ["opendrvr.sqlite3", "opendrvr user data.sqlite3"] {
+            let mut config = AppConfig::default();
+            config.database.file_name = name.to_string();
+            assert!(config.validate().is_ok(), "{name:?} should be accepted");
+        }
     }
 
     #[test]

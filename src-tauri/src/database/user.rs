@@ -196,8 +196,22 @@ async fn integrity_check(pool: &SqlitePool) -> AppResult<()> {
 }
 
 /// Moves a broken database (and its WAL sidecars) aside before a retry.
+///
+/// Only regular files are moved. If the configured path is a directory, a
+/// symlink, or something else, it is left untouched so recovery can never
+/// relocate user data outside the intended file.
 fn quarantine(path: &Path) -> AppResult<Option<PathBuf>> {
-    if !path.exists() {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    if !metadata.file_type().is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "refusing to quarantine a user database path that is not a regular file"
+        );
         return Ok(None);
     }
 
@@ -310,6 +324,27 @@ mod tests {
             .count();
 
         assert_eq!(quarantined, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_never_quarantines_a_directory() {
+        let dir = TestDir::new("user-directory-path");
+        let path = dir.path().join("opendrvr.sqlite3");
+        fs::create_dir(&path).expect("create directory at database path");
+
+        assert!(
+            UserDatabase::initialize(&path).await.is_err(),
+            "a directory cannot be opened as a database"
+        );
+        assert!(path.is_dir(), "the directory must be left in place");
+
+        let quarantined = fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+
+        assert_eq!(quarantined, 0);
     }
 
     #[tokio::test]

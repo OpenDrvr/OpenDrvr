@@ -1,11 +1,13 @@
 # OpenDrvr backend architecture
 
-This document describes the Rust backend as of **Phase 5**. The structure is
+This document describes the Rust backend as of **Phase 6**. The structure is
 intentionally conservative: it reserves clear module boundaries without adding
-abstractions that the application does not need yet. Hardware scanning, driver
-discovery, manufacturer integrations, downloads, and installations are **not**
-implemented. Phase 5 connected the React shell to typed commands and persisted
-application preferences in the user database.
+abstractions that the application does not need yet. Phase 6 added a portable
+hardware model and a Windows Plug and Play enumerator built on CfgMgr32. The
+scan is not exposed to the frontend yet, and driver discovery, manufacturer
+integrations, downloads, and installations remain **not** implemented. See
+[`HARDWARE_INTEGRATION.md`](HARDWARE_INTEGRATION.md) for the API assessment and
+the Phase 7 plan.
 
 ## Layout
 
@@ -24,7 +26,13 @@ src-tauri/src/
 │   ├── database.rs      get_database_health
 │   ├── preferences.rs   get_preferences, update_preferences, reset_preferences
 │   └── system.rs        get_backend_status
-├── hardware/mod.rs      Hardware identification boundary (planned)
+├── hardware/
+│   ├── mod.rs           Hardware service and provider injection
+│   ├── id.rs            Device instance IDs, bus types, PCI/USB identifiers
+│   ├── status.rs        Device state and CM_PROB mapping
+│   ├── category.rs      Conservative device categorization
+│   ├── model.rs         Portable device, driver, location, snapshot models
+│   └── provider.rs      DeviceEnumerator trait and typed errors
 ├── drivers/mod.rs       Driver matching boundary (planned)
 ├── sources/mod.rs       Official manufacturer sources boundary (planned)
 ├── database/
@@ -35,8 +43,10 @@ src-tauri/src/
 │   └── test_support.rs  Temporary directories for tests
 ├── downloads/mod.rs     Download orchestration boundary (planned)
 ├── platform/
-│   ├── mod.rs           Portable platform helpers and support check
-│   └── windows.rs       Windows-only integration surface (future Win32 calls)
+│   ├── mod.rs           Portable platform helpers and device-enumerator factory
+│   ├── windows.rs       Windows integration entry point
+│   └── windows/
+│       └── device_tree.rs  CfgMgr32 enumeration, properties, and status
 └── utils/mod.rs         Small shared helpers such as input validation
 ```
 
@@ -48,13 +58,14 @@ src-tauri/
 ├── migrations/0002_user_configuration.sql Structured configuration table
 ├── resources/catalog/schema.sql           Catalog schema source
 ├── resources/catalog/catalog.sqlite3      Generated read-only snapshot
-└── examples/build_catalog.rs              Catalog regeneration tool
+├── examples/build_catalog.rs              Catalog regeneration tool
+└── HARDWARE_INTEGRATION.md                 Windows API assessment and Phase 7 plan
 ```
 
 Each directory is a Rust module with its own `mod.rs`. Keeping a directory
 instead of a single file leaves room for submodules (for example
-`hardware/wmi.rs` or `platform/windows/setupapi.rs`) without restructuring the
-crate later.
+`platform/windows/wmi.rs` or `platform/windows/setupapi.rs`) without
+restructuring the crate later.
 
 ## Request flow
 
@@ -104,8 +115,10 @@ Discard, and Restore defaults actions.
 
 The frontend never receives a SQL connection or SQL text. It sees only the IPC
 DTOs defined in `commands/` and `database/models.rs`, which use camelCase Serde
-fields. Hardware, driver, and download pages render planned empty states until
-their backend modules exist; they do not synthesize device or transfer data.
+fields. The Hardware page renders a planned empty state even though the native
+enumeration layer is prepared; the scan command and UI land in Phase 7. Driver
+and download pages remain planned. They do not synthesize device or transfer
+data.
 
 The desktop shell uses hash navigation and a custom component library rather
 than a router or a UI framework. This keeps the webview dependency surface small
@@ -256,12 +269,40 @@ status, database health, and the three preference operations. The earlier
 `ping` and `database_test_query` diagnostics were removed once real preference
 commands replaced them.
 
+### Windows hardware enumeration
+
+Phase 6 introduces the native hardware layer without exposing it to the UI.
+CfgMgr32 is the primary provider because it enumerates the present Plug and Play
+tree without class GUIDs and returns authoritative instance IDs, status flags,
+problem codes, and typed device properties. SetupAPI is reserved for future
+read-only driver-package and INF inspection, and WMI/CIM for supplemental
+CPU/GPU/motherboard/BIOS/memory facts.
+
+The hardware domain (`hardware/`) owns a portable model and a `DeviceEnumerator`
+trait; it never imports Win32 or Tauri. `platform::windows::device_tree` is the
+only module that calls CfgMgr32. `AppState` injects the platform enumerator into
+`HardwareService`, inverting the dependency so tests and future providers can
+supply a fake.
+
+Enumeration is present-only (`CM_GETIDLIST_FILTER_PRESENT`). Only failure to read
+the device ID list is fatal; per-device and per-property failures degrade into
+`ScanDiagnostics` while the rest of the snapshot is returned. Raw instance IDs
+and hardware IDs are authoritative; PCI/USB parsing is best-effort and malformed
+identifiers are preserved verbatim. Devices with no driver metadata, no hardware
+IDs, or an unknown problem code are still recorded.
+
+`HardwareService::scan()` exists but is not registered as a command. No scan is
+persisted, no catalog match is attempted, and the module remains `Planned`.
+Phase 7 will add the IPC command, UI, persistence, catalog matching, and
+supplemental WMI data.
+
 ### Windows isolation
 
 The application targets Windows 10/11 x64, but Win32 APIs are confined to
 `platform::windows`. General logic, commands, and domain services stay portable
-and safe. Future WMI, SetupAPI, CfgMgr32, and registry code belongs under
-`platform`, keeping the unsafe surface small and auditable.
+and safe. CfgMgr32 enumeration now lives in `platform::windows::device_tree`;
+future WMI, SetupAPI, and registry code also belongs under `platform`, keeping
+the unsafe surface small and auditable.
 
 `platform::is_supported` reports whether the current target is Windows x64. The
 UI-facing status command exposes this as `supportedTarget`.
@@ -279,6 +320,12 @@ Unit tests cover configuration validation and disk round-tripping, error
 sanitization, module status reporting, input validation, and preference
 defaults, parsing, normalization, and rejection rules.
 
+Hardware tests cover PCI/USB identifier parsing, malformed-ID preservation,
+instance-ID validation, device status and `CM_PROB_*` mapping, category
+classification, snapshot helpers, provider injection, multi-string decoding,
+GUID formatting, FILETIME conversion, and a real-hardware enumeration of the
+local present device tree.
+
 Database tests cover initial creation, reopening with persisted preferences,
 migration output, corrupt-file recovery, catalog read-only access, missing
 catalog degradation, bundled/user separation, atomic preference writes, reset,
@@ -294,7 +341,8 @@ directly without a webview.
 
 ## Deliberate omissions
 
-- No hardware enumeration, WMI queries, or SetupAPI calls.
+- No hardware scan command, persisted scan, or frontend hardware data.
+- No WMI queries, SetupAPI driver-package inspection, or driver installation.
 - No driver matching, manufacturer integrations, or source scraping.
 - No network requests, downloads, or installers.
 - No real catalog hardware or driver rows yet; only schema and metadata ship.

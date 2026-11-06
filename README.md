@@ -3,11 +3,13 @@
 **Open Driver** — an open-source Windows utility for identifying computer hardware, discovering
 compatible drivers, and providing downloads from official manufacturer sources.
 
-> Status: **Phase 5 — application integration.** OpenDrvr now connects the React shell to typed Rust
-> commands and the embedded SQLite user database. Settings preferences are validated, persisted, and
-> restored across restarts, while database health and application metadata come from live backend
-> calls. Hardware detection, driver lookup, downloads, and installations are still intentionally not
-> implemented. See [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) for the backend design.
+> Status: **Phase 6 — native hardware integration.** The Rust backend now has a portable hardware
+> model and a Windows Plug and Play enumerator built on CfgMgr32. Device instance IDs, hardware and
+> compatible IDs, driver facts, problem codes, and device categories are read from the live device
+> tree and covered by tests. The scan is not yet exposed as an IPC command, and the Hardware page
+> still shows a planned empty state. Driver lookup, downloads, and installations remain intentionally
+> unimplemented. See [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) and
+> [`src-tauri/HARDWARE_INTEGRATION.md`](src-tauri/HARDWARE_INTEGRATION.md) for the design.
 
 ## Stack
 
@@ -17,6 +19,7 @@ compatible drivers, and providing downloads from official manufacturer sources.
 | Backend  | Rust (stable, MSVC toolchain)                 |
 | Frontend | React 19 + TypeScript 6 (strict mode)         |
 | Database | SQLite via SQLx 0.8 (bundled, no server)      |
+| Windows  | `windows-rs` 0.62 (CfgMgr32, Windows-only)    |
 | Bundler  | Vite 8                                        |
 | Styling  | Tailwind CSS 4 (dark-first design tokens)     |
 | Icons    | Lucide React                                  |
@@ -96,12 +99,13 @@ Release artifacts are written under
 │   ├── src/lib.rs            Tauri builder, startup, and state registration
 │   ├── src/main.rs           Windows desktop entry point
 │   ├── src/commands/         Thin IPC adapters and command registration
-│   ├── src/hardware/         Hardware identification boundary
+│   ├── src/hardware/         Portable device model, IDs, status, categories, provider trait
 │   ├── src/drivers/          Driver discovery boundary
 │   ├── src/sources/          Official source registry boundary
 │   ├── src/database/         Embedded SQLite: user database and bundled catalog
 │   ├── src/downloads/        Download orchestration boundary
 │   ├── src/platform/         Platform helpers and Windows-only integration
+│   │   └── windows/          CfgMgr32 device enumeration (device_tree.rs)
 │   ├── src/config.rs         Typed configuration and validation
 │   ├── src/error.rs          Internal and IPC error types
 │   ├── src/logging.rs        Structured logging setup
@@ -112,6 +116,7 @@ Release artifacts are written under
 │   ├── resources/catalog/    Catalog schema and read-only SQLite snapshot
 │   ├── examples/             Maintenance tools (catalog regeneration)
 │   ├── ARCHITECTURE.md       Backend design and decisions
+│   ├── HARDWARE_INTEGRATION.md  Windows API assessment and Phase 7 plan
 │   ├── capabilities/         Tauri 2 window capabilities
 │   ├── icons/                Windows icon assets
 │   ├── build.rs              Tauri build script
@@ -222,8 +227,9 @@ browser-style back/forward works without a router dependency. The current page i
 The initial pages are deliberately honest:
 
 - **Overview** introduces OpenDrvr, its principles, and the real backend module states.
-- **Hardware**, **Drivers**, and **Downloads** show planned empty states; no hardware, driver status,
-  or transfer data is invented.
+- **Hardware** still shows a planned empty state even though the native enumeration layer is ready;
+  the scan command and UI land in Phase 7. **Drivers** and **Downloads** remain planned. No hardware,
+  driver status, or transfer data is invented.
 - **Settings** reads and writes real preferences through Rust: theme, update channel, download folder,
   and three download/update switches. Changes are tracked as a draft with explicit **Save changes**,
   **Discard**, and **Restore defaults** actions, inline validation, loading skeletons, error states,
@@ -232,6 +238,44 @@ The initial pages are deliberately honest:
 
 `__APP_VERSION__` is injected from `package.json` by `vite.config.ts` and used by the sidebar and
 About dialog.
+
+## Hardware integration
+
+Phase 6 adds the native layer that the future hardware scanner will use. It is
+not yet connected to the UI: there is no scan command, no persisted scan, and no
+catalog matching. The Hardware page remains an honest planned empty state.
+
+The primary API is **CfgMgr32** (`cfgmgr32.dll`) through `windows-rs`. It
+enumerates the present Plug and Play device tree, reads device and driver
+properties, and returns Configuration Manager status flags and problem codes.
+SetupAPI is reserved for future read-only INF and driver-package inspection;
+WMI/CIM is reserved for supplemental facts such as CPU model, GPU memory,
+motherboard model, BIOS version, and physical memory.
+
+The backend reads and preserves:
+
+- the device instance ID and enumerator
+- hardware IDs and compatible IDs, in the order Windows reports them
+- best-effort PCI and USB fields, while keeping malformed IDs verbatim
+- device class, class GUID, manufacturer, friendly name, and description
+- parent instance ID, location information, bus number, and address
+- driver provider, version, date, description, INF path, and service name
+- device state, raw problem code, and a coarse problem classification
+
+The `hardware` module stays portable and Tauri-free. It owns the data model and
+the `DeviceEnumerator` trait. `platform::windows::device_tree` is the only code
+that calls CfgMgr32, and `AppState` injects the platform provider into
+`HardwareService`. This keeps the unsafe Win32 surface small and lets tests use a
+fake enumerator.
+
+Standard users can enumerate devices and read most properties. Some properties
+may be denied; the scanner records those as diagnostics and continues. Driver
+installation, driver-store changes, and some WMI classes require administrator
+rights and are not part of Phase 6. OpenDrvr does not auto-elevate.
+
+See [`src-tauri/HARDWARE_INTEGRATION.md`](src-tauri/HARDWARE_INTEGRATION.md) for
+the full API assessment, data model, privileges, compatibility notes, and the
+Phase 7 plan.
 
 ## Embedded database
 
