@@ -11,6 +11,7 @@ use sqlx::SqlitePool;
 
 use crate::config::DatabaseConfig;
 use crate::error::{AppError, AppResult};
+use crate::preferences::{AppPreferences, PREFERENCE_KEYS};
 use crate::state::{ModuleState, ModuleStatus};
 
 mod catalog;
@@ -20,7 +21,7 @@ mod user;
 #[cfg(test)]
 mod test_support;
 
-pub use models::{CatalogDatabaseHealth, DatabaseHealth, DatabaseTestResult, UserDatabaseHealth};
+pub use models::{CatalogDatabaseHealth, DatabaseHealth, UserDatabaseHealth};
 
 use catalog::CatalogDatabase;
 use user::UserDatabase;
@@ -203,46 +204,44 @@ impl Database {
         DatabaseHealth { user, catalog }
     }
 
-    /// Diagnostic read that exercises a bound parameter and both databases.
-    pub async fn test_query(&self, key: &str) -> AppResult<DatabaseTestResult> {
-        let user = match &self.user {
-            UserState::Ready(database) => database,
-            UserState::Failed(_) => {
-                return Err(AppError::Database(
-                    "user database is unavailable".to_string(),
-                ))
-            }
-        };
-
-        let preference = user.get_preference(key).await?;
-
-        let catalog = match &self.catalog {
-            CatalogState::Ready(database) => match database.health().await {
-                Ok(health) => Some(health),
-                Err(error) => {
-                    tracing::warn!(error = %error, "catalog test query failed");
-                    None
-                }
-            },
-            CatalogState::Unavailable(_) => None,
-        };
-
-        Ok(DatabaseTestResult {
-            user_database_ready: true,
-            catalog_database_ready: catalog.is_some(),
-            preference,
-            catalog_schema_version: catalog.as_ref().and_then(|health| health.schema_version),
-            catalog_manufacturer_count: catalog.as_ref().map(|health| health.manufacturer_count),
-        })
-    }
-
-    pub async fn set_preference(&self, key: &str, value: &str) -> AppResult<()> {
+    fn user_database(&self) -> AppResult<&UserDatabase> {
         match &self.user {
-            UserState::Ready(database) => database.set_preference(key, value).await,
+            UserState::Ready(database) => Ok(database),
             UserState::Failed(_) => Err(AppError::Database(
                 "user database is unavailable".to_string(),
             )),
         }
+    }
+
+    /// Reads the typed preferences, applying defaults for missing or malformed
+    /// individual values.
+    pub async fn get_preferences(&self) -> AppResult<AppPreferences> {
+        let entries = self.user_database()?.all_preferences().await?;
+        Ok(AppPreferences::from_stored(entries))
+    }
+
+    /// Validates and writes the complete preference set in one transaction.
+    pub async fn update_preferences(
+        &self,
+        preferences: &AppPreferences,
+    ) -> AppResult<AppPreferences> {
+        let preferences = preferences.clone().normalized();
+        preferences.validate()?;
+
+        let entries = preferences.to_entries();
+        self.user_database()?.set_preferences(&entries).await?;
+
+        Ok(preferences)
+    }
+
+    /// Removes persisted preferences so the next read returns application
+    /// defaults.
+    pub async fn reset_preferences(&self) -> AppResult<AppPreferences> {
+        self.user_database()?
+            .clear_preferences(&PREFERENCE_KEYS)
+            .await?;
+
+        Ok(AppPreferences::default())
     }
 
     #[cfg(test)]
@@ -298,7 +297,10 @@ mod tests {
         .await;
 
         database
-            .set_preference("database.probe", "ok")
+            .update_preferences(&AppPreferences {
+                notify_downloads: false,
+                ..AppPreferences::default()
+            })
             .await
             .expect("write user preference");
 
@@ -328,35 +330,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_uses_parameterized_preference_lookup() {
-        let dir = TestDir::new("database-test-query");
-        let database = Database::initialize(
-            &DatabaseConfig::default(),
-            Some(dir.path()),
-            Some(&bundled_catalog()),
-        )
-        .await;
+    async fn preferences_persist_across_reopen_and_reset() {
+        let dir = TestDir::new("database-preferences");
+        let database =
+            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None).await;
 
-        database
-            .set_preference("diagnostic.probe", "present")
-            .await
-            .expect("write preference");
+        assert_eq!(
+            database.get_preferences().await.expect("defaults"),
+            AppPreferences::default()
+        );
 
-        let result = database
-            .test_query("diagnostic.probe")
+        let preferences = AppPreferences {
+            download_directory: "D:\\OpenDrvr".to_string(),
+            check_catalog_updates: false,
+            notify_downloads: false,
+            keep_download_history: false,
+            ..AppPreferences::default()
+        };
+        let saved = database
+            .update_preferences(&preferences)
             .await
-            .expect("query");
-        assert!(result.user_database_ready);
-        assert!(result.catalog_database_ready);
-        assert_eq!(result.preference.as_deref(), Some("present"));
-        assert_eq!(result.catalog_schema_version, Some(1));
-        assert_eq!(result.catalog_manufacturer_count, Some(0));
+            .expect("save preferences");
+        assert_eq!(saved, preferences);
 
-        let missing = database
-            .test_query("diagnostic.missing")
-            .await
-            .expect("query");
-        assert_eq!(missing.preference, None);
+        drop(database);
+
+        let reopened =
+            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None).await;
+        assert_eq!(
+            reopened.get_preferences().await.expect("reload"),
+            preferences
+        );
+
+        assert_eq!(
+            reopened.reset_preferences().await.expect("reset"),
+            AppPreferences::default()
+        );
+        assert_eq!(
+            reopened.get_preferences().await.expect("after reset"),
+            AppPreferences::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_preferences_are_rejected_before_writing() {
+        let dir = TestDir::new("database-invalid-preferences");
+        let database =
+            Database::initialize(&DatabaseConfig::default(), Some(dir.path()), None).await;
+
+        let preferences = AppPreferences {
+            download_directory: "  ".to_string(),
+            ..AppPreferences::default()
+        };
+        assert!(database.update_preferences(&preferences).await.is_err());
+        assert_eq!(
+            database.get_preferences().await.expect("defaults"),
+            AppPreferences::default()
+        );
     }
 
     #[tokio::test]
@@ -371,6 +401,6 @@ mod tests {
         let health = database.health().await;
         assert_eq!(health.user.status, DatabaseComponentStatus::Unavailable);
         assert_eq!(database.status().state, ModuleState::Unavailable);
-        assert!(database.test_query("anything").await.is_err());
+        assert!(database.get_preferences().await.is_err());
     }
 }

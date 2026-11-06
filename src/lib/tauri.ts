@@ -33,14 +33,6 @@ export interface DatabaseHealth {
   catalog: CatalogDatabaseHealth;
 }
 
-export interface DatabaseTestResult {
-  userDatabaseReady: boolean;
-  catalogDatabaseReady: boolean;
-  preference: string | null;
-  catalogSchemaVersion: number | null;
-  catalogManufacturerCount: number | null;
-}
-
 export type ModuleState = "ready" | "planned" | "unavailable";
 
 export interface ModuleStatus {
@@ -54,6 +46,44 @@ export interface BackendStatus {
   platform: string;
   supportedTarget: boolean;
   modules: ModuleStatus[];
+}
+
+export type ThemePreference = "dark";
+export type UpdateChannel = "stable";
+
+export interface AppPreferences {
+  theme: ThemePreference;
+  updateChannel: UpdateChannel;
+  downloadDirectory: string;
+  checkCatalogUpdates: boolean;
+  notifyDownloads: boolean;
+  keepDownloadHistory: boolean;
+}
+
+/** Error payload returned by Rust commands. */
+export interface CommandErrorPayload {
+  code: string;
+  message: string;
+}
+
+/** Normalized IPC failure with the backend's stable error code attached. */
+export class IpcError extends Error {
+  readonly code: string;
+
+  constructor(payload: CommandErrorPayload) {
+    super(payload.message);
+    this.name = "IpcError";
+    this.code = payload.code;
+  }
+}
+
+function isCommandErrorPayload(value: unknown): value is CommandErrorPayload {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as { code?: unknown; message?: unknown };
+  return typeof candidate.code === "string" && typeof candidate.message === "string";
 }
 
 /**
@@ -73,33 +103,49 @@ function requireTauriRuntime(): void {
 }
 
 /**
- * Calls the Rust command defined in `src-tauri/src/lib.rs`.
+ * Single IPC entry point. Every command goes through here so runtime checks and
+ * error normalization cannot drift between callers.
  */
+async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  requireTauriRuntime();
+
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    if (isCommandErrorPayload(error)) {
+      throw new IpcError(error);
+    }
+
+    throw error;
+  }
+}
+
+/** Safe application metadata used to confirm the Rust backend is reachable. */
 export async function getAppInfo(): Promise<AppInfo> {
-  requireTauriRuntime();
-  return invoke<AppInfo>("get_app_info");
+  return invokeCommand<AppInfo>("get_app_info");
 }
 
-/**
- * Returns live health for the writable user database and the bundled catalog.
- */
+/** Returns live health for the writable user database and the bundled catalog. */
 export async function getDatabaseHealth(): Promise<DatabaseHealth> {
-  requireTauriRuntime();
-  return invoke<DatabaseHealth>("get_database_health");
+  return invokeCommand<DatabaseHealth>("get_database_health");
 }
 
-/**
- * Returns the backend version, platform and per-module lifecycle state.
- */
+/** Returns the backend version, platform and per-module lifecycle state. */
 export async function getBackendStatus(): Promise<BackendStatus> {
-  requireTauriRuntime();
-  return invoke<BackendStatus>("get_backend_status");
+  return invokeCommand<BackendStatus>("get_backend_status");
 }
 
-/**
- * Runs a harmless parameterized diagnostic query through the Rust backend.
- */
-export async function databaseTestQuery(key?: string): Promise<DatabaseTestResult> {
-  requireTauriRuntime();
-  return invoke<DatabaseTestResult>("database_test_query", { key });
+/** Reads persisted application preferences. Missing values use defaults. */
+export async function getPreferences(): Promise<AppPreferences> {
+  return invokeCommand<AppPreferences>("get_preferences");
+}
+
+/** Validates and persists the complete preference set. */
+export async function updatePreferences(preferences: AppPreferences): Promise<AppPreferences> {
+  return invokeCommand<AppPreferences>("update_preferences", { preferences });
+}
+
+/** Removes saved preferences and returns the application defaults. */
+export async function resetPreferences(): Promise<AppPreferences> {
+  return invokeCommand<AppPreferences>("reset_preferences");
 }

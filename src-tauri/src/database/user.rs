@@ -104,31 +104,65 @@ impl UserDatabase {
         })
     }
 
-    /// Reads a preference with a bound parameter. Keys and values are never
-    /// interpolated into SQL.
-    pub async fn get_preference(&self, key: &str) -> AppResult<Option<String>> {
-        sqlx::query_scalar::<_, String>("SELECT value FROM app_preferences WHERE key = ?1")
-            .bind(key)
-            .fetch_optional(&self.pool)
+    /// Reads every stored preference row. The table is intentionally small, so
+    /// a single query is cheaper than one round trip per preference key.
+    pub async fn all_preferences(&self) -> AppResult<Vec<(String, String)>> {
+        sqlx::query_as::<_, (String, String)>("SELECT key, value FROM app_preferences")
+            .fetch_all(&self.pool)
             .await
-            .map_err(|error| db_error("failed to read preference", error))
+            .map_err(|error| db_error("failed to read preferences", error))
     }
 
-    pub async fn set_preference(&self, key: &str, value: &str) -> AppResult<()> {
-        sqlx::query(
-            "INSERT INTO app_preferences (key, value, updated_at)
-             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-             ON CONFLICT(key) DO UPDATE SET
-                 value = excluded.value,
-                 updated_at = excluded.updated_at",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await
-        .map_err(|error| db_error("failed to write preference", error))?;
+    /// Writes a complete preference set atomically.
+    pub async fn set_preferences(&self, entries: &[(&str, String)]) -> AppResult<()> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("failed to begin preference update", error))?;
 
-        Ok(())
+        for (key, value) in entries {
+            sqlx::query(
+                "INSERT INTO app_preferences (key, value, updated_at)
+                 VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 ON CONFLICT(key) DO UPDATE SET
+                     value = excluded.value,
+                     updated_at = excluded.updated_at",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| db_error("failed to write preference", error))?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("failed to commit preference update", error))
+    }
+
+    /// Removes the supplied preference keys atomically so a reset is complete
+    /// even if one key was never written.
+    pub async fn clear_preferences(&self, keys: &[&str]) -> AppResult<()> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| db_error("failed to begin preference reset", error))?;
+
+        for key in keys {
+            sqlx::query("DELETE FROM app_preferences WHERE key = ?1")
+                .bind(key)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| db_error("failed to clear preference", error))?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| db_error("failed to commit preference reset", error))
     }
 
     #[cfg(test)]
@@ -204,31 +238,25 @@ mod tests {
         let database = UserDatabase::initialize(&path).await.expect("initialize");
         assert_eq!(database.schema_version(), 2);
         database
-            .set_preference("theme", "dark")
+            .set_preferences(&[("theme", "dark".to_string())])
             .await
             .expect("write preference");
 
-        assert_eq!(
-            database
-                .get_preference("theme")
-                .await
-                .expect("read")
-                .as_deref(),
-            Some("dark")
-        );
+        assert!(database
+            .all_preferences()
+            .await
+            .expect("read")
+            .contains(&("theme".to_string(), "dark".to_string())));
 
         drop(database);
 
         let reopened = UserDatabase::initialize(&path).await.expect("reopen");
         assert_eq!(reopened.schema_version(), 2);
-        assert_eq!(
-            reopened
-                .get_preference("theme")
-                .await
-                .expect("read")
-                .as_deref(),
-            Some("dark")
-        );
+        assert!(reopened
+            .all_preferences()
+            .await
+            .expect("read")
+            .contains(&("theme".to_string(), "dark".to_string())));
     }
 
     #[tokio::test]
@@ -282,6 +310,34 @@ mod tests {
             .count();
 
         assert_eq!(quarantined, 1);
+    }
+
+    #[tokio::test]
+    async fn preferences_are_written_atomically_and_cleared() {
+        let dir = TestDir::new("user-preferences");
+        let path = dir.path().join("opendrvr.sqlite3");
+        let database = UserDatabase::initialize(&path).await.expect("initialize");
+
+        let entries = [
+            ("ui.theme", "dark".to_string()),
+            ("downloads.directory", "Downloads".to_string()),
+        ];
+        database
+            .set_preferences(&entries)
+            .await
+            .expect("write preferences");
+
+        let stored = database.all_preferences().await.expect("read preferences");
+        assert!(stored.contains(&("ui.theme".to_string(), "dark".to_string())));
+        assert!(stored.contains(&("downloads.directory".to_string(), "Downloads".to_string())));
+
+        database
+            .clear_preferences(&["ui.theme"])
+            .await
+            .expect("clear preference");
+        let stored = database.all_preferences().await.expect("read preferences");
+        assert!(!stored.iter().any(|(key, _)| key == "ui.theme"));
+        assert!(stored.iter().any(|(key, _)| key == "downloads.directory"));
     }
 
     #[tokio::test]

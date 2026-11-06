@@ -7,6 +7,7 @@ mod error;
 mod hardware;
 mod logging;
 mod platform;
+mod preferences;
 mod sources;
 mod state;
 mod utils;

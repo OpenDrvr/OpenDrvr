@@ -1,4 +1,12 @@
-import { CircleAlert, FolderOpen, Info, RefreshCw, RotateCcw, Settings } from "lucide-react";
+import {
+  CircleAlert,
+  CircleCheck,
+  FolderOpen,
+  Info,
+  RefreshCw,
+  RotateCcw,
+  Settings,
+} from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { PageHeader, SectionHeader } from "../components/layout/PageHeader";
 import {
@@ -16,7 +24,10 @@ import {
   TableHeaderCell,
   TableRow,
 } from "../components/ui";
+import { describeError } from "../lib/errors";
+import type { AppPreferences, ThemePreference, UpdateChannel } from "../lib/tauri";
 import { useToast } from "../lib/toast";
+import { usePreferences } from "../lib/usePreferences";
 import type { BackendSnapshotState } from "../lib/useBackendSnapshot";
 
 const THEME_OPTIONS = [
@@ -29,6 +40,17 @@ const CHANNEL_OPTIONS = [
   { value: "stable", label: "Stable" },
   { value: "beta", label: "Beta (planned)", disabled: true },
 ] as const;
+
+function preferencesEqual(a: AppPreferences, b: AppPreferences): boolean {
+  return (
+    a.theme === b.theme &&
+    a.updateChannel === b.updateChannel &&
+    a.downloadDirectory === b.downloadDirectory &&
+    a.checkCatalogUpdates === b.checkCatalogUpdates &&
+    a.notifyDownloads === b.notifyDownloads &&
+    a.keepDownloadHistory === b.keepDownloadHistory
+  );
+}
 
 function PreferenceCard({
   title,
@@ -49,9 +71,50 @@ function PreferenceCard({
   );
 }
 
+function PreferencesLoading() {
+  return (
+    <div className="space-y-5" aria-busy="true">
+      {[0, 1].map((card) => (
+        <section key={card} className="rounded-xl border border-white/[0.07] bg-surface-900/40">
+          <div className="border-b border-white/[0.06] px-5 py-4">
+            <Skeleton className="h-4 w-28" />
+            <Skeleton className="mt-2 h-3 w-56" />
+          </div>
+          <div className="space-y-5 px-5 py-4">
+            {Array.from({ length: card === 0 ? 2 : 4 }, (_, index) => (
+              <div key={index}>
+                <Skeleton className="h-3 w-20" />
+                <Skeleton className="mt-2 h-9 w-full" />
+              </div>
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function PreferencesError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div
+      role="alert"
+      className="flex gap-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.05] p-4"
+    >
+      <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-400" aria-hidden="true" />
+      <div className="min-w-0">
+        <p className="text-sm font-medium text-amber-200">Preferences unavailable</p>
+        <p className="mt-1 text-xs leading-5 text-amber-100/70">{message}</p>
+        <Button size="sm" className="mt-2" onClick={onRetry}>
+          Retry
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function DetailRow({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex items-center justify-between gap-4 border-b border-white/[0.05] py-2.5 last:border-0 last:pb-0 first:pt-0">
+    <div className="flex items-center justify-between gap-4 border-b border-white/[0.05] py-2.5 first:pt-0 last:border-0 last:pb-0">
       <dt className="text-xs text-slate-400">{label}</dt>
       <dd className="truncate font-mono text-xs text-slate-300">{value}</dd>
     </div>
@@ -66,43 +129,118 @@ export interface SettingsPageProps {
 
 export function SettingsPage({ backend, onRefresh, onAbout }: SettingsPageProps) {
   const { push } = useToast();
-  const [theme, setTheme] = useState("dark");
-  const [channel, setChannel] = useState("stable");
-  const [directory, setDirectory] = useState("Downloads");
-  const [checkUpdates, setCheckUpdates] = useState(true);
-  const [notifyDownloads, setNotifyDownloads] = useState(true);
-  const [keepHistory, setKeepHistory] = useState(true);
+  const {
+    state: preferencesState,
+    pendingAction,
+    save,
+    reset,
+    refresh: refreshPreferences,
+  } = usePreferences();
+  const [draft, setDraft] = useState<AppPreferences | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const snapshot = backend.status === "ready" ? backend.snapshot : null;
+  const savedPreferences =
+    preferencesState.status === "ready" ? preferencesState.preferences : null;
+  const current = draft ?? savedPreferences;
+  const isDirty =
+    current !== null && savedPreferences !== null && !preferencesEqual(current, savedPreferences);
+  const directoryError =
+    current !== null && current.downloadDirectory.trim().length === 0
+      ? "Enter a folder name or path."
+      : undefined;
+  const busy = pendingAction !== null;
 
-  const resetPreview = () => {
-    setTheme("dark");
-    setChannel("stable");
-    setDirectory("Downloads");
-    setCheckUpdates(true);
-    setNotifyDownloads(true);
-    setKeepHistory(true);
-    push({
-      tone: "info",
-      title: "Preview preferences reset",
-      description: "Defaults were restored for this session. Nothing was written to disk.",
-    });
+  const updatePreference = <K extends keyof AppPreferences>(key: K, value: AppPreferences[K]) => {
+    if (!current) {
+      return;
+    }
+
+    setDraft({ ...current, [key]: value });
+    setSaveError(null);
+  };
+
+  const discardChanges = () => {
+    setDraft(null);
+    setSaveError(null);
+  };
+
+  const handleSave = async () => {
+    if (!current || !isDirty || directoryError) {
+      return;
+    }
+
+    setSaveError(null);
+
+    try {
+      const saved = await save({
+        ...current,
+        downloadDirectory: current.downloadDirectory.trim(),
+      });
+
+      if (!saved) {
+        return;
+      }
+
+      setDraft(null);
+      push({
+        tone: "success",
+        title: "Preferences saved",
+        description: "Your settings are stored in the local OpenDrvr database.",
+      });
+    } catch (error) {
+      const message = describeError(error);
+      setSaveError(message);
+      push({
+        tone: "error",
+        title: "Could not save preferences",
+        description: message,
+      });
+    }
+  };
+
+  const handleReset = async () => {
+    setSaveError(null);
+
+    try {
+      const defaults = await reset();
+
+      if (!defaults) {
+        return;
+      }
+
+      setDraft(null);
+      push({
+        tone: "success",
+        title: "Defaults restored",
+        description: "OpenDrvr preferences were reset to their defaults.",
+      });
+    } catch (error) {
+      const message = describeError(error);
+      setSaveError(message);
+      push({
+        tone: "error",
+        title: "Could not restore defaults",
+        description: message,
+      });
+    }
   };
 
   return (
     <div className="space-y-8">
       <PageHeader
         title="Settings"
-        description="Application preferences, local storage and build details."
-        badge={<StatusIndicator tone="planned" label="Preview" />}
+        description="Preferences, local storage and build details."
         actions={
           <Button
             variant="ghost"
             size="sm"
             leadingIcon={<RotateCcw className="size-3.5" aria-hidden="true" />}
-            onClick={resetPreview}
+            loading={pendingAction === "reset"}
+            disabled={preferencesState.status !== "ready" || busy}
+            onClick={handleReset}
           >
-            Reset preview
+            Restore defaults
           </Button>
         }
       />
@@ -110,79 +248,160 @@ export function SettingsPage({ backend, onRefresh, onAbout }: SettingsPageProps)
       <div className="flex items-start gap-3 rounded-xl border border-accent-400/20 bg-accent-500/[0.06] p-4">
         <Info className="mt-0.5 size-4 shrink-0 text-accent-300" aria-hidden="true" />
         <div className="min-w-0">
-          <h2 className="text-sm font-medium text-accent-200">Preferences are a preview</h2>
+          <h2 className="text-sm font-medium text-accent-200">Preferences are stored locally</h2>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-400">
-            These controls demonstrate the settings layout. Changes apply to this session only and
-            are not saved yet, so they will reset when OpenDrvr restarts.
+            Changes are written to the OpenDrvr user database on this computer and restored the next
+            time the application starts.
           </p>
         </div>
       </div>
 
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_21rem]">
         <div className="space-y-5">
-          <PreferenceCard title="Appearance" description="How OpenDrvr presents its interface.">
-            <Dropdown
-              label="Theme"
-              value={theme}
-              onChange={setTheme}
-              options={THEME_OPTIONS}
-              hint="OpenDrvr is dark-first. Additional themes are not implemented yet."
+          {preferencesState.status === "loading" ? (
+            <PreferencesLoading />
+          ) : preferencesState.status === "error" ? (
+            <PreferencesError
+              message={preferencesState.message}
+              onRetry={() => void refreshPreferences()}
             />
-            <Switch
-              label="Compact spacing"
-              description="Reduce vertical padding in lists and tables. Planned for a later phase."
-              checked={false}
-              onChange={() => undefined}
-              disabled
-            />
-          </PreferenceCard>
-
-          <PreferenceCard
-            title="Updates and downloads"
-            description="Defaults for driver package transfers."
-          >
-            <Dropdown
-              label="Update channel"
-              value={channel}
-              onChange={setChannel}
-              options={CHANNEL_OPTIONS}
-              hint="Only the stable channel is available in this build."
-            />
-            <Input
-              label="Download folder"
-              value={directory}
-              onChange={(event) => setDirectory(event.target.value)}
-              hint="Preview value only — a native folder picker arrives with download management."
-              trailing={
-                <IconButton
-                  icon={FolderOpen}
-                  label="Choose download folder"
-                  tooltip="Folder picker not available yet"
-                  tooltipSide="left"
-                  size="sm"
+          ) : current ? (
+            <>
+              <PreferenceCard title="Appearance" description="How OpenDrvr presents its interface.">
+                <Dropdown
+                  label="Theme"
+                  value={current.theme}
+                  onChange={(value) => updatePreference("theme", value as ThemePreference)}
+                  options={THEME_OPTIONS}
+                  hint="OpenDrvr is dark-first. Additional themes are planned."
+                  disabled={busy}
+                />
+                <Switch
+                  label="Compact spacing"
+                  description="Reduce vertical padding in lists and tables. Planned for a later phase."
+                  checked={false}
+                  onChange={() => undefined}
                   disabled
                 />
-              }
-            />
-            <Switch
-              label="Check for catalog updates on launch"
-              description="Refresh driver metadata when OpenDrvr starts. Requires the update service."
-              checked={checkUpdates}
-              onChange={setCheckUpdates}
-            />
-            <Switch
-              label="Notify when a download completes"
-              description="Show a desktop notification after a package finishes transferring."
-              checked={notifyDownloads}
-              onChange={setNotifyDownloads}
-            />
-            <Switch
-              label="Keep download history"
-              description="Retain a local record of completed transfers until you clear it."
-              checked={keepHistory}
-              onChange={setKeepHistory}
-            />
-          </PreferenceCard>
+              </PreferenceCard>
+
+              <PreferenceCard
+                title="Updates and downloads"
+                description="Defaults for driver package transfers."
+              >
+                <Dropdown
+                  label="Update channel"
+                  value={current.updateChannel}
+                  onChange={(value) => updatePreference("updateChannel", value as UpdateChannel)}
+                  options={CHANNEL_OPTIONS}
+                  hint="Only the stable channel is available in this build."
+                  disabled={busy}
+                />
+                <Input
+                  label="Download folder"
+                  value={current.downloadDirectory}
+                  onChange={(event) => updatePreference("downloadDirectory", event.target.value)}
+                  {...(directoryError ? { error: directoryError } : {})}
+                  hint="Stored locally. A native folder picker arrives with download management."
+                  maxLength={260}
+                  disabled={busy}
+                  trailing={
+                    <IconButton
+                      icon={FolderOpen}
+                      label="Choose download folder"
+                      tooltip="Folder picker not available yet"
+                      tooltipSide="left"
+                      size="sm"
+                      disabled
+                    />
+                  }
+                />
+                <Switch
+                  label="Check for catalog updates on launch"
+                  description="Refresh driver metadata when OpenDrvr starts. Requires the update service."
+                  checked={current.checkCatalogUpdates}
+                  onChange={(checked) => updatePreference("checkCatalogUpdates", checked)}
+                  disabled={busy}
+                />
+                <Switch
+                  label="Notify when a download completes"
+                  description="Show a desktop notification after a package finishes transferring."
+                  checked={current.notifyDownloads}
+                  onChange={(checked) => updatePreference("notifyDownloads", checked)}
+                  disabled={busy}
+                />
+                <Switch
+                  label="Keep download history"
+                  description="Retain a local record of completed transfers until you clear it."
+                  checked={current.keepDownloadHistory}
+                  onChange={(checked) => updatePreference("keepDownloadHistory", checked)}
+                  disabled={busy}
+                />
+              </PreferenceCard>
+
+              {saveError && (
+                <div
+                  role="alert"
+                  className="flex gap-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.05] p-4"
+                >
+                  <CircleAlert
+                    className="mt-0.5 size-4 shrink-0 text-amber-400"
+                    aria-hidden="true"
+                  />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-amber-200">Preferences were not saved</p>
+                    <p className="mt-1 text-xs leading-5 text-amber-100/70">{saveError}</p>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.07] bg-surface-900/40 px-4 py-3">
+                <div className="flex min-w-0 items-start gap-2.5">
+                  {isDirty ? (
+                    <span
+                      className="mt-1.5 size-2 shrink-0 rounded-full bg-amber-400"
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <CircleCheck
+                      className="mt-0.5 size-4 shrink-0 text-emerald-400"
+                      aria-hidden="true"
+                    />
+                  )}
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-slate-200">
+                      {isDirty ? "Unsaved changes" : "All changes saved"}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-slate-500">
+                      {isDirty
+                        ? "Save to write them to the local database."
+                        : "Preferences match the local database."}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={discardChanges}
+                    disabled={!isDirty || busy}
+                  >
+                    Discard
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={handleSave}
+                    loading={pendingAction === "save"}
+                    disabled={!isDirty || Boolean(directoryError) || busy}
+                  >
+                    Save changes
+                  </Button>
+                </div>
+              </div>
+            </>
+          ) : null}
         </div>
 
         <div className="space-y-5">

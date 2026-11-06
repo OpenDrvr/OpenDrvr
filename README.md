@@ -3,12 +3,11 @@
 **Open Driver** — an open-source Windows utility for identifying computer hardware, discovering
 compatible drivers, and providing downloads from official manufacturer sources.
 
-> Status: **Phase 4 — desktop UI and design system.** OpenDrvr now has a dark-first desktop shell,
-> a reusable React component library, and initial layouts for every navigation page. SQLite still
-> runs inside the Rust backend with a read-only bundled driver catalog and a separate writable user
-> database. Hardware detection, driver lookup, downloads, and installations are intentionally not
-> implemented yet. See [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) for the backend
-> design.
+> Status: **Phase 5 — application integration.** OpenDrvr now connects the React shell to typed Rust
+> commands and the embedded SQLite user database. Settings preferences are validated, persisted, and
+> restored across restarts, while database health and application metadata come from live backend
+> calls. Hardware detection, driver lookup, downloads, and installations are still intentionally not
+> implemented. See [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) for the backend design.
 
 ## Stack
 
@@ -85,10 +84,12 @@ Release artifacts are written under
 │   │   └── ui/               Buttons, inputs, tables, dialogs, toasts, status, empty states
 │   ├── pages/                Overview, Hardware, Drivers, Downloads, Settings
 │   └── lib/
-│       ├── tauri.ts          Typed wrapper around Tauri IPC
+│       ├── tauri.ts          Typed IPC wrappers, error normalization, preference DTOs
+│       ├── errors.ts         Unknown-error to user-safe message conversion
 │       ├── navigation.ts     Page definitions and hash parsing
 │       ├── useAppNavigation.ts  Hash-based desktop navigation
 │       ├── useBackendSnapshot.ts  App, module, and database status loading
+│       ├── usePreferences.ts Persisted preference loading, saving and reset
 │       ├── toast.ts          Toast context contract
 │       └── cn.ts             Conditional class names
 ├── src-tauri/
@@ -104,6 +105,7 @@ Release artifacts are written under
 │   ├── src/config.rs         Typed configuration and validation
 │   ├── src/error.rs          Internal and IPC error types
 │   ├── src/logging.rs        Structured logging setup
+│   ├── src/preferences.rs    Typed preferences, defaults, validation and key mapping
 │   ├── src/state.rs          Central application state
 │   ├── src/utils/            Shared validation helpers
 │   ├── migrations/           Versioned user-database migrations
@@ -126,13 +128,26 @@ Release artifacts are written under
 
 ## Frontend ↔ Rust communication
 
-The frontend calls the Rust command through Tauri's IPC bridge:
+Every frontend call goes through a single typed wrapper, so runtime checks and error normalization
+cannot drift between commands:
 
 ```ts
 // src/lib/tauri.ts
-import { invoke } from "@tauri-apps/api/core";
+async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  requireTauriRuntime();
 
-export const getAppInfo = () => invoke<AppInfo>("get_app_info");
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    if (isCommandErrorPayload(error)) {
+      throw new IpcError(error);
+    }
+
+    throw error;
+  }
+}
+
+export const getAppInfo = () => invokeCommand<AppInfo>("get_app_info");
 ```
 
 ```rust
@@ -152,10 +167,11 @@ macro_rules! generate_command_handlers {
     () => {
         tauri::generate_handler![
             $crate::commands::app::get_app_info,
-            $crate::commands::database::database_test_query,
             $crate::commands::database::get_database_health,
+            $crate::commands::preferences::get_preferences,
+            $crate::commands::preferences::reset_preferences,
+            $crate::commands::preferences::update_preferences,
             $crate::commands::system::get_backend_status,
-            $crate::commands::system::ping,
         ]
     };
 }
@@ -164,13 +180,21 @@ macro_rules! generate_command_handlers {
 .invoke_handler(crate::generate_command_handlers!())
 ```
 
-The UI loads these values once into a backend snapshot and presents them on the Overview page, in the
-Settings local-data panel, in the sidebar status card, and in the About dialog. `get_backend_status`
-reports each domain module's lifecycle state, and `ping` is a harmless round-trip command that
-demonstrates input validation and typed error handling.
+Only commands used by the frontend are registered. There is no generic query, SQL, or diagnostic
+command.
 
-Errors cross the IPC boundary as `{ code, message }`. Internal details (paths, OS errors) are
-logged with `tracing` and never exposed to the webview.
+The UI loads application, module, and database values once into a backend snapshot and presents them
+on the Overview page, in the Settings local-data panel, in the sidebar status card, and in the About
+dialog. `get_backend_status` reports each domain module's lifecycle state.
+
+Settings reads and writes go through `usePreferences`, which exposes loading, ready, and error states
+plus a pending action. Saves send the complete typed preference set, and Rust returns the canonical
+stored value after trimming and validation; the UI never invents a value the database did not accept.
+Overlapping writes are blocked while an action is pending.
+
+Errors cross the IPC boundary as `{ code, message }`. The wrapper converts them into an `IpcError`
+with the stable backend code attached. Internal details (paths, OS errors) are logged with `tracing`
+and never exposed to the webview.
 
 ## Desktop UI
 
@@ -200,8 +224,11 @@ The initial pages are deliberately honest:
 - **Overview** introduces OpenDrvr, its principles, and the real backend module states.
 - **Hardware**, **Drivers**, and **Downloads** show planned empty states; no hardware, driver status,
   or transfer data is invented.
-- **Settings** demonstrates the preferences layout with a clear “preview” notice. Controls are not
-  persisted yet, while the local-data panel shows real schema and catalog values from Rust.
+- **Settings** reads and writes real preferences through Rust: theme, update channel, download folder,
+  and three download/update switches. Changes are tracked as a draft with explicit **Save changes**,
+  **Discard**, and **Restore defaults** actions, inline validation, loading skeletons, error states,
+  and success/error notifications. The local-data panel shows real schema and catalog values from
+  Rust.
 
 `__APP_VERSION__` is injected from `package.json` by `vite.config.ts` and used by the sidebar and
 About dialog.
@@ -265,8 +292,25 @@ immutable snapshot, not mutate the installed file.
 
 - `get_database_health` — live status, schema version, table count, writability and catalog
   manufacturer count.
-- `database_test_query` — harmless parameterized preference lookup that also reports catalog
-  availability. No SQL text is accepted from the frontend.
+- `get_preferences` — reads the typed preference set, applying defaults for missing or malformed
+  individual values.
+- `update_preferences` — trims and validates the complete preference set, writes it in one
+  transaction, and returns the canonical stored value.
+- `reset_preferences` — removes exactly the keys this build owns and returns application defaults.
+
+Preferences are stored as individual keys in `app_preferences`:
+
+| Key                            | Default     | Notes                                  |
+| ------------------------------ | ----------- | -------------------------------------- |
+| `ui.theme`                     | `dark`      | Only `dark` is implemented             |
+| `updates.channel`              | `stable`    | Only `stable` is implemented           |
+| `downloads.directory`          | `Downloads` | Trimmed, 1–260 characters, single line |
+| `updates.check_on_launch`      | `true`      | Boolean                                |
+| `downloads.notify_on_complete` | `true`      | Boolean                                |
+| `downloads.keep_history`       | `true`      | Boolean                                |
+
+Defaults, key mapping, validation, and normalization live in Rust. React sends only typed values; no
+SQL text is accepted from the frontend.
 
 ### Regenerating the catalog
 

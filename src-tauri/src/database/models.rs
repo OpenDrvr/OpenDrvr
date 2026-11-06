@@ -61,14 +61,3 @@ impl CatalogDatabaseHealth {
         }
     }
 }
-
-/// Result of the harmless diagnostic query exposed through Tauri.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DatabaseTestResult {
-    pub user_database_ready: bool,
-    pub catalog_database_ready: bool,
-    pub preference: Option<String>,
-    pub catalog_schema_version: Option<i64>,
-    pub catalog_manufacturer_count: Option<i64>,
-}
