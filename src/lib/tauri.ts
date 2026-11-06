@@ -41,6 +41,21 @@ export interface DatabaseTestResult {
   catalogManufacturerCount: number | null;
 }
 
+export type ModuleState = "ready" | "planned" | "unavailable";
+
+export interface ModuleStatus {
+  name: string;
+  state: ModuleState;
+  detail: string;
+}
+
+export interface BackendStatus {
+  version: string;
+  platform: string;
+  supportedTarget: boolean;
+  modules: ModuleStatus[];
+}
+
 /**
  * Tauri injects this global into the WebView. It is absent when the frontend
  * is opened in a regular browser via `pnpm dev`.
@@ -71,6 +86,14 @@ export async function getAppInfo(): Promise<AppInfo> {
 export async function getDatabaseHealth(): Promise<DatabaseHealth> {
   requireTauriRuntime();
   return invoke<DatabaseHealth>("get_database_health");
+}
+
+/**
+ * Returns the backend version, platform and per-module lifecycle state.
+ */
+export async function getBackendStatus(): Promise<BackendStatus> {
+  requireTauriRuntime();
+  return invoke<BackendStatus>("get_backend_status");
 }
 
 /**

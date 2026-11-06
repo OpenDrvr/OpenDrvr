@@ -1,10 +1,11 @@
 # OpenDrvr backend architecture
 
-This document describes the Rust backend as of **Phase 3**. The structure is
+This document describes the Rust backend as of **Phase 4**. The structure is
 intentionally conservative: it reserves clear module boundaries without adding
 abstractions that the application does not need yet. Hardware scanning, driver
 discovery, manufacturer integrations, downloads, and installations are **not**
-implemented.
+implemented. Phase 4 added the desktop UI shell and design system on top of the
+Phase 3 database foundation; the IPC surface is unchanged.
 
 ## Layout
 
@@ -77,6 +78,26 @@ React rejects with { code, message }
 Commands are deliberately thin adapters. They validate frontend input, call a
 service from `AppState`, and convert errors. Domain modules never import Tauri
 types, so they can be unit-tested without a running application.
+
+## Frontend contract
+
+The React shell consumes the backend through typed wrappers in
+`src/lib/tauri.ts`. On startup, `useBackendSnapshot` loads `get_app_info`,
+`get_backend_status`, and `get_database_health` in parallel and exposes a single
+snapshot to the sidebar, Overview, Settings, and About views. Refreshes repeat
+the same read-only calls; no UI control writes to the database or starts a
+background operation.
+
+The frontend never receives a SQL connection or SQL text. It sees only the
+IPC DTOs defined in `commands/` and `database/models.rs`, which use camelCase
+Serde fields. Hardware, driver, and download pages render planned empty states
+until their backend modules exist; they do not synthesize device or transfer
+data. Settings preferences are explicitly marked as a session-only preview and
+are not persisted yet.
+
+The desktop shell uses hash navigation and a custom component library rather
+than a router or a UI framework. This keeps the webview dependency surface small
+and makes the IPC boundary the only coupling between React and Rust.
 
 ## Decisions
 
@@ -227,6 +248,7 @@ directly without a webview.
 - No driver matching, manufacturer integrations, or source scraping.
 - No network requests, downloads, or installers.
 - No real catalog hardware or driver rows yet; only schema and metadata ship.
+- No persisted UI preferences; the Settings controls are a labelled preview.
 - No Tauri events; commands return values only.
 
 These are boundaries, not placeholders for hidden behavior.

@@ -3,10 +3,12 @@
 **Open Driver** — an open-source Windows utility for identifying computer hardware, discovering
 compatible drivers, and providing downloads from official manufacturer sources.
 
-> Status: **Phase 3 — embedded database.** SQLite runs inside the Rust backend with a read-only
-> bundled driver catalog and a separate writable user database. Hardware detection, driver lookup,
-> downloads, and installations are intentionally not implemented yet. See
-> [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) for the backend design.
+> Status: **Phase 4 — desktop UI and design system.** OpenDrvr now has a dark-first desktop shell,
+> a reusable React component library, and initial layouts for every navigation page. SQLite still
+> runs inside the Rust backend with a read-only bundled driver catalog and a separate writable user
+> database. Hardware detection, driver lookup, downloads, and installations are intentionally not
+> implemented yet. See [`src-tauri/ARCHITECTURE.md`](src-tauri/ARCHITECTURE.md) for the backend
+> design.
 
 ## Stack
 
@@ -17,8 +19,9 @@ compatible drivers, and providing downloads from official manufacturer sources.
 | Frontend | React 19 + TypeScript 6 (strict mode)         |
 | Database | SQLite via SQLx 0.8 (bundled, no server)      |
 | Bundler  | Vite 8                                        |
-| Styling  | Tailwind CSS 4                                |
+| Styling  | Tailwind CSS 4 (dark-first design tokens)     |
 | Icons    | Lucide React                                  |
+| UI       | Custom React component library                |
 | Tooling  | pnpm 12, ESLint 10, Prettier 3, Cargo/rustfmt |
 | Target   | Windows 10 / Windows 11 x64                   |
 
@@ -74,10 +77,20 @@ Release artifacts are written under
 ```text
 .
 ├── src/                      React + TypeScript frontend
-│   ├── App.tsx               Application shell and backend status panel
+│   ├── App.tsx               Persistent shell: sidebar, page routing, backend snapshot
 │   ├── main.tsx              React entry point
-│   ├── index.css             Tailwind import, theme, base styles
-│   └── lib/tauri.ts          Typed wrapper around Tauri IPC
+│   ├── index.css             Tailwind import, dark/purple tokens, base styles
+│   ├── components/
+│   │   ├── layout/           Sidebar, page headers, About dialog
+│   │   └── ui/               Buttons, inputs, tables, dialogs, toasts, status, empty states
+│   ├── pages/                Overview, Hardware, Drivers, Downloads, Settings
+│   └── lib/
+│       ├── tauri.ts          Typed wrapper around Tauri IPC
+│       ├── navigation.ts     Page definitions and hash parsing
+│       ├── useAppNavigation.ts  Hash-based desktop navigation
+│       ├── useBackendSnapshot.ts  App, module, and database status loading
+│       ├── toast.ts          Toast context contract
+│       └── cn.ts             Conditional class names
 ├── src-tauri/
 │   ├── src/lib.rs            Tauri builder, startup, and state registration
 │   ├── src/main.rs           Windows desktop entry point
@@ -151,12 +164,47 @@ macro_rules! generate_command_handlers {
 .invoke_handler(crate::generate_command_handlers!())
 ```
 
-The UI displays the returned values in the **Rust backend connection** panel, which doubles as an
-end-to-end IPC check. `get_backend_status` reports each domain module's lifecycle state, and `ping`
-is a harmless round-trip command that demonstrates input validation and typed error handling.
+The UI loads these values once into a backend snapshot and presents them on the Overview page, in the
+Settings local-data panel, in the sidebar status card, and in the About dialog. `get_backend_status`
+reports each domain module's lifecycle state, and `ping` is a harmless round-trip command that
+demonstrates input validation and typed error handling.
 
 Errors cross the IPC boundary as `{ code, message }`. Internal details (paths, OS errors) are
 logged with `tracing` and never exposed to the webview.
+
+## Desktop UI
+
+The frontend is a Windows desktop shell, not a website. It uses a persistent 236 px sidebar with
+application branding, grouped navigation (Overview, Hardware, Drivers, Downloads, Settings), live
+backend and local-data status, the application version, and an About dialog. The main content area
+scrolls independently and the layout is verified down to the configured minimum window size.
+
+Design system:
+
+- Near-black and charcoal surfaces with a faint violet undertone.
+- Electric purple (`#8b5cf6`) as the primary accent.
+- Segoe UI Variable typography, subtle 1 px borders, restrained shadows, and small radii.
+- Tokens live in `src/index.css` through Tailwind's `@theme`; no shadcn/ui or dashboard template is
+  used.
+- Custom components in `src/components/ui`: buttons, icon buttons, inputs, search fields, dropdowns,
+  tabs, tables, status indicators, native dialogs, tooltips, empty states, spinners/skeletons, switches,
+  and toast notifications.
+- Layout components in `src/components/layout`: sidebar, page/section headers, and About dialog.
+
+Navigation is hash-based (`#/overview`, `#/hardware`, and so on) through `useAppNavigation`, so
+browser-style back/forward works without a router dependency. The current page is also exposed with
+`aria-current="page"` for assistive technology.
+
+The initial pages are deliberately honest:
+
+- **Overview** introduces OpenDrvr, its principles, and the real backend module states.
+- **Hardware**, **Drivers**, and **Downloads** show planned empty states; no hardware, driver status,
+  or transfer data is invented.
+- **Settings** demonstrates the preferences layout with a clear “preview” notice. Controls are not
+  persisted yet, while the local-data panel shows real schema and catalog values from Rust.
+
+`__APP_VERSION__` is injected from `package.json` by `vite.config.ts` and used by the sidebar and
+About dialog.
 
 ## Embedded database
 
